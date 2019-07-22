@@ -1,6 +1,6 @@
-==========
-gzippi
-==========
+=====
+gzipi
+=====
 
 Tools for indexing gzip files to support random-like access.
 
