@@ -1,5 +1,5 @@
 pytest
 pytest-runner
-boto3
 flake8
-
+smart-open==1.8.4
+plumbum==1.6.7

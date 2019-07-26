@@ -21,11 +21,15 @@ import gzip
 import io
 import json
 import logging
+import multiprocessing
+import os
+import shutil
 import struct
+import tempfile
 import time
-import urllib.parse
 
-import boto3
+import plumbum
+import smart_open
 
 _GZIP_HEADER = b'\x1f\x8b\x08'
 """A magic gzip header and two compression flags.
@@ -48,9 +52,9 @@ Offset   Length   Contents
                      bit 5 set: file is encrypted, encryption header present
                      bit 6,7:   reserved
 """
-_GZIP_HEADER_LENGHT = 10
+_GZIP_HEADER_LENGTH = 10
 """The length of main fields of gzip header, in bytes."""
-_WINDOW_OFFSET = (_GZIP_HEADER_LENGHT - 1) * -1
+_WINDOW_OFFSET = (_GZIP_HEADER_LENGTH - 1) * -1
 _MIN_CHUNK_SIZE = 100000
 """The minimum amount of bytes in each chunk.
 
@@ -81,6 +85,9 @@ DEFAULT_CHUNK_SIZE = 5000
 _MAX_RECORDS_PER_BATCH = 5000
 """The maximum number of records to retrieve in a single batch."""
 
+_SORT_CPU_COUNT = multiprocessing.cpu_count()
+_SORT_BUFFER_SIZE = '1G'
+
 _LOGGER = logging.getLogger(__name__)
 _LOGGER.addHandler(logging.NullHandler())
 
@@ -90,7 +97,7 @@ def _is_valid_gzip_header(gzip_header):
     # Extra sanity checks to ensure that we are working with the actual gzip header.
     # There is a chance that compressed data may look like the start of gzip header.
     #
-    if len(gzip_header) < _GZIP_HEADER_LENGHT:
+    if len(gzip_header) < _GZIP_HEADER_LENGTH:
         return False
 
     try:
@@ -136,15 +143,15 @@ def _iterate_archives(fin, buffer_size=_MIN_CHUNK_SIZE):
         #
         window = archive[_WINDOW_OFFSET:] + chunk
         archive += chunk
-        if len(window) < _GZIP_HEADER_LENGHT or window.rfind(_GZIP_HEADER) == -1:
+        if len(window) < _GZIP_HEADER_LENGTH or window.rfind(_GZIP_HEADER) == -1:
             continue
 
         header_pos = archive.rfind(_GZIP_HEADER)
         if any([
             header_pos <= 0,
-            len(archive) < _GZIP_HEADER_LENGHT,
-            len(archive) - header_pos < _GZIP_HEADER_LENGHT,
-            not _is_valid_gzip_header(archive[header_pos:header_pos + _GZIP_HEADER_LENGHT])
+            len(archive) < _GZIP_HEADER_LENGTH,
+            len(archive) - header_pos < _GZIP_HEADER_LENGTH,
+            not _is_valid_gzip_header(archive[header_pos:header_pos + _GZIP_HEADER_LENGTH])
         ]):
             continue
 
@@ -158,7 +165,7 @@ def _iterate_archives(fin, buffer_size=_MIN_CHUNK_SIZE):
 
 def index_csv_file(
     csv_file, output_file, column=DEFAULT_CSV_COLUMN,
-    delimiter=DEFAULT_CSV_DELIMITER, index_lines=True, min_chunk_size=_MIN_CHUNK_SIZE
+    delimiter=DEFAULT_CSV_DELIMITER, min_chunk_size=_MIN_CHUNK_SIZE
 ):
     """Index a CSV file from the file stream.
 
@@ -173,56 +180,55 @@ def index_csv_file(
     :param stream output_file: The binary file stream to write output to.
     :param int column: The index of the key column in the input file.
     :param str delimiter: The CSV delimiter to use.
-    :param bool index_lines: If True, indexes lines inside gzip chunks as well.
     :param int min_chunk_size: The minimum number of bytes in a single gzip chunk.
     """
     chunk_iterator = _iterate_archives(csv_file, buffer_size=min_chunk_size)
     for i, (arch, start_offset, end_offset) in enumerate(chunk_iterator):
         _LOGGER.info('processed %s chunk, offset: %s-%s' % (i, start_offset, end_offset))
-        if index_lines:
-            line_start, line_end = 0, 0
+        line_start, line_end = 0, 0
         with gzip.open(arch, mode='rb') as fin:
             csv_in = _StreamWrapper(fin, decode_lines=True)
             csv_reader = csv.reader(csv_in, delimiter=delimiter)
             for row in csv_reader:
-                index = '%s|%s|%s' % (row[column], start_offset, end_offset - start_offset)
-                if index_lines:
-                    line_start = line_end
-                    line_end = line_start + len(csv_in.current_line)
-                    index += '|%s|%s' % (line_start, line_end - line_start)
+                line_start = line_end
+                line_end = line_start + len(csv_in.current_line)
+                index = '%s|%s|%s|%s|%s' % (
+                    row[column], start_offset,
+                    end_offset - start_offset,
+                    line_start, line_end - line_start,
+                )
                 output_file.write(index.encode(_TEXT_ENCODING) + b'\n')
 
 
-def index_json_file(json_file, output_file, field=DEFAULT_JSON_FIELD, index_lines=True,
+def index_json_file(json_file, output_file, field=DEFAULT_JSON_FIELD,
                     min_chunk_size=_MIN_CHUNK_SIZE):
     """Index a JSON file from the file stream.
 
-    Possible formats of the index file:
+    Format of the index file:
 
-    key|gzip_start_offset|gzip_length
-    key|gzip_start_offset|gzip_length|line_start_offset|line_length (when index_lines is True)
+        key|gzip_start_offset|gzip_length|line_start_offset|line_length
 
     All offsets are in bytes.
 
     :param stream json_file: The binary file stream to read input from.
     :param stream output_file: The binary file stream to write output to.
     :param str field: The name of the key field in the JSON file.
-    :param bool index_lines: If True, indexes lines inside gzip chunks as well.
     :param int min_chunk_size: The minimum number of bytes in a single gzip chunk.
     """
     chunk_iterator = _iterate_archives(json_file, buffer_size=min_chunk_size)
     for i, (arch, start_offset, end_offset) in enumerate(chunk_iterator):
         _LOGGER.info('processed %s chunk, offset: %s-%s' % (i, start_offset, end_offset))
-        if index_lines:
-            line_start, line_end = 0, 0
+        line_start, line_end = 0, 0
         with gzip.open(arch, mode='rb') as json_in:
             for line in json_in:
                 data = json.loads(line.decode(_TEXT_ENCODING))
-                index = '%s|%s|%s' % (data[field], start_offset, end_offset - start_offset)
-                if index_lines:
-                    line_start = line_end
-                    line_end = line_start + len(line)
-                    index += '|%s|%s' % (line_start, line_end - line_start)
+                line_start = line_end
+                line_end = line_start + len(line)
+                index = '%s|%s|%s|%s|%s' % (
+                    data[field],
+                    start_offset, end_offset - start_offset,
+                    line_start, line_end - line_start,
+                )
                 output_file.write(index.encode(_TEXT_ENCODING) + b'\n')
 
 
@@ -245,31 +251,19 @@ def _scan_index(keys, index_fin):
     # Groups indexes by gzip chunks and filters them.
     #
     keys_idx = collections.defaultdict(list)
+    keys = set(keys)
+    keys_seen = set()
     csv_reader = csv.reader(index_fin, delimiter=DEFAULT_CSV_DELIMITER)
     for row in csv_reader:
         key, start_offset = row[0], int(row[1])
         if key in keys:
             keys_idx[start_offset].append(row)
+            keys_seen.add(key)
+
+    missing_keys = keys - keys_seen
+    if missing_keys:
+        _LOGGER.error("Missing keys: %r" % missing_keys)
     return keys_idx
-
-
-def _scan_json(index, fin, field, multiindex=False):
-    chunk_data = {}
-    if multiindex:
-        for row in index:
-            fin.seek(int(row[3]))
-            line = fin.read(int(row[4])).decode(_TEXT_ENCODING)
-            data = json.loads(line)
-            chunk_data[data[field]] = line
-    else:
-        keys = set([r[0] for r in index])
-        for line in fin:
-            data = json.loads(line)
-            if data[field] in keys:
-                chunk_data[data[field]] = line.decode(_TEXT_ENCODING)
-            if len(chunk_data) == len(keys):
-                break
-    return chunk_data
 
 
 class _StreamWrapper:
@@ -291,122 +285,36 @@ class _StreamWrapper:
             return self.current_line
 
 
-def _scan_csv(index, fin, column, delimiter, multiindex=False):
-    chunk_data = {}
-
-    if multiindex:
-        for row in index:
-            fin.seek(int(row[3]))
-            line = fin.read(int(row[4])).decode(_TEXT_ENCODING)
-            record = next(csv.reader(io.StringIO(line), delimiter=delimiter))
-            chunk_data[record[column]] = line
-    else:
-        #
-        # We use a custom wrapper here, because it's not possible to iterate
-        # over raw and parsed strings at the same time using csv.reader.
-        #
-        fin = _StreamWrapper(fin, decode_lines=True)
-        csv_reader = csv.reader(fin, delimiter=delimiter)
-        keys = set([r[0] for r in index])
-        for row in csv_reader:
-            if row[column] in keys:
-                chunk_data[row[column]] = fin.current_line.decode(_TEXT_ENCODING)
-            if len(chunk_data) == len(index):
-                break
-    return chunk_data
-
-
-def _retrieve_from_local_path(keys_idx, fin, reader):
-    batch_data = {}
-    for group in keys_idx.values():
-        index = group[0]
-        start_offset, offset_length = int(index[1]), int(index[2])
-        fin.seek(start_offset)
-        gzip_chunk = io.BytesIO()
-        gzip_chunk.write(fin.read(offset_length))
-        gzip_chunk.seek(0)
-        with gzip.open(gzip_chunk, 'rb') as gzip_in:
-            batch_data.update(reader(group, gzip_in))
-    return batch_data
-
-
-def _parse_s3_url(uri):
-    uri = urllib.parse.urlparse(uri)
-    if uri.scheme != 's3':
-        raise ValueError("Unrecognized URI scheme: %s" % uri.scheme)
-    return uri.netloc, uri.path.lstrip('/')
-
-
-def _retrieve_from_s3(keys_idx, s3_path, reader):
-    bucket, key = _parse_s3_url(s3_path)
-    obj = boto3.resource('s3').Object(bucket, key)
-    batch_data = {}
-    for group in keys_idx.values():
-        index = group[0]
-        start_offset, offset_length = int(index[1]), int(index[2])
-        byte_range = 'bytes=%s-%s' % (start_offset, start_offset + offset_length - 1)
-        stream = obj.get(Range=byte_range)['Body']
-        gzip_chunk = io.BytesIO()
-        gzip_chunk.write(stream.read())
-        gzip_chunk.seek(0)
-        with gzip.open(gzip_chunk, 'rb') as gzip_fin:
-            batch_data.update(reader(group, gzip_fin))
-    return batch_data
-
-
-def _is_multiindex(fin):
-    n_cols = fin.readline().count(DEFAULT_CSV_DELIMITER) + 1
-    fin.seek(0)
-    return n_cols == 5
-
-
-def _retrieve(keys, file_path, index_fin, output_stream, reader):
-    if file_path.startswith('s3://'):
-        retrieve, input_fin = _retrieve_from_s3, file_path
-    else:
-        retrieve, input_fin = _retrieve_from_local_path, open(file_path, 'rb')
-
-    for keys in _batch_iterator(keys, decode_lines=True):
-        keys_idx = _scan_index(set(keys), index_fin)
-        chunk_data = retrieve(keys_idx, input_fin, reader)
-        for key in keys:
-            if key in chunk_data:
-                output_stream.write(chunk_data[key].encode(_TEXT_ENCODING))
-            else:
-                output_stream.write(b'\n')
-
-
-def retrieve_from_csv(keys_fin, csv_path, index_path, output_stream, column=DEFAULT_CSV_COLUMN,
-                      delimiter=DEFAULT_CSV_DELIMITER):
-    """Retrieve data from indexed CSV file.
+def retrieve(keys_fin, file_path, index_fin, output_stream):
+    """Retrieve data from an indexed file.
 
     :param file keys_fin: A steam with list of keys to retrieve.
-    :param str csv_path: A local S3 path to the file retrieve data from.
-    :param str  index_path: A file stream to read index from.
+    :param str file_path: A local S3 path to the file retrieve data from.
+    :param str index_fin: A file stream to read index from.
     :param file output_stream: A file stream to output results to.
-    :param int column: The index of the key column in the input file.
-    :param str delimiter: The CSV delimiter to use.
-    """
-    index_fin = gzip.open(index_path, 'rt')
-    multiindex = _is_multiindex(index_fin)
-    reader = functools.partial(_scan_csv, column=column, delimiter=delimiter, multiindex=multiindex)
-    return _retrieve(keys_fin, csv_path, index_fin, output_stream, reader)
-
-
-def retrieve_from_json(keys_fin, json_path, index_path, output_stream, field=DEFAULT_JSON_FIELD):
-    """Retrieve data from indexed JSON file.
-
-    :param file keys_fin: A steam with list of keys to retrieve.
-    :param str json_path: A local S3 path to the file retrieve data from.
-    :param str  index_path: A file stream to read index from.
-    :param file output_stream: A file stream to output results to.
-    :param str field: The name of the key field in the JSON file.
     """
 
-    index_fin = gzip.open(index_path, 'rt')
-    multiindex = _is_multiindex(index_fin)
-    reader = functools.partial(_scan_json, field=field, multiindex=multiindex)
-    return _retrieve(keys_fin, json_path, index_fin, output_stream, reader)
+    transport_params = {'resource_kwargs': {'endpoint_url': 'http://127.0.0.1:9000'}}
+    input_fin = smart_open.open(file_path, 'rb', transport_params=transport_params, ignore_ext=True)
+    for keys in _batch_iterator(keys_fin, decode_lines=True):
+        keys_idx = _scan_index(keys, index_fin)
+        displayed = set()
+        for group in keys_idx.values():
+            index = group[0]
+            start_offset, offset_length = int(index[1]), int(index[2])
+            input_fin.seek(start_offset)
+            gzip_chunk = io.BytesIO()
+            gzip_chunk.write(input_fin.read(offset_length))
+            gzip_chunk.seek(0)
+            with gzip.open(gzip_chunk, 'rb') as gzip_fin:
+                for row in group:
+                    gzip_fin.seek(int(row[3]))
+                    domain = row[0]
+                    line = gzip_fin.read(int(row[4]))
+                    output_stream.write(line)
+                    if domain in displayed:
+                        _LOGGER.error("multiple matches for %s key")
+                    displayed.add(domain)
 
 
 def _extract_keys_from_json(line, field):
@@ -419,26 +327,22 @@ def _extract_keys_from_csv(line, column, delimiter):
     return next(reader)[column]
 
 
-def _repack(fin, fout, index_fout, chunk_size, extractor, index_lines=True):
+def _repack(fin, fout, index_fout, chunk_size, extractor):
     start_offset, end_offset = 0, 0
     with gzip.open(fin, 'rb') as fin:
         for batch in _batch_iterator(fin, decode_lines=False, batch_size=chunk_size):
             keys = []
-            if index_lines:
-                line_indexes = []
+            line_indexes = []
             chunk = io.BytesIO()
             gzipped_chunk = gzip.GzipFile(fileobj=chunk, mode='wb')
 
-            if index_lines:
-                line_start, line_end = 0, 0
-
+            line_start, line_end = 0, 0
             for line in batch:
                 key = extractor(line)
                 keys.append(key)
-                if index_lines:
-                    line_start = line_end
-                    line_end = line_start + len(line)
-                    line_indexes.append('|%s|%s' % (line_start, line_end - line_start))
+                line_start = line_end
+                line_end = line_start + len(line)
+                line_indexes.append('|%s|%s' % (line_start, line_end - line_start))
                 gzipped_chunk.write(line)
 
             gzipped_chunk.close()
@@ -449,10 +353,40 @@ def _repack(fin, fout, index_fout, chunk_size, extractor, index_lines=True):
             end_offset = start_offset + chunk.getbuffer().nbytes
             for i, key in enumerate(keys):
                 index = '%s|%s|%s' % (key, start_offset, end_offset - start_offset)
-                if index_lines:
-                    index += line_indexes[i]
+                index += line_indexes[i]
                 index_fout.write(index.encode(_TEXT_ENCODING) + b'\n')
             index_fout.flush()
+
+
+def sort_file(file_path):
+    """Sort a file using GNU toolchain.
+
+    :param str file_path: The path to file to sort.
+    """
+    sorted_handle, tmp_path = tempfile.mkstemp(prefix='gzippi')
+    os.close(sorted_handle)
+    shutil.move(file_path, tmp_path)
+
+    #
+    # We use sort from GNU toolchain here, because index file can be pretty big.
+    #
+    sort_flags = ['--parallel=%s' % _SORT_CPU_COUNT, '--buffer-size=%s' % _SORT_BUFFER_SIZE]
+    gzcat = plumbum.local['gzcat'][tmp_path]
+    cat = plumbum.local['cat'][tmp_path]
+    gzip_exe = plumbum.local['gzip']['--stdout']
+    sort = plumbum.local['gsort'][sort_flags]
+
+    file_path = os.path.abspath(file_path)
+    is_gzipped = file_path.endswith('.gz')
+
+    with plumbum.local.env(LC_ALL='C'):
+        try:
+            if is_gzipped:
+                return ((gzcat | sort | gzip_exe) > file_path) & plumbum.FG
+            else:
+                return ((cat | sort) > file_path)()
+        finally:
+            os.remove(tmp_path)
 
 
 def repack_json_file(fin, fout, index_fout, chunk_size, field=DEFAULT_JSON_FIELD):

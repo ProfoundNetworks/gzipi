@@ -14,17 +14,17 @@ Type ``gzipi --help`` in the terminal for more information.
 #
 
 import argparse
-import gzip
 import logging
 import sys
 import os.path as P
+import smart_open
 
 from . import lib
 
 _LOGGER = logging.getLogger(__name__)
 _BINARY_STDIN, _BINARY_STDOUT = sys.stdin.buffer, sys.stdout.buffer
-
-
+_GZIPI_EXTENSION = '.gzi'
+_CONSENT_STRINGS = ('y', 'yes')
 _CLI_DESCRIPTION = """gzipi  <command> [<args>]
 
 Available commands:
@@ -33,6 +33,10 @@ Available commands:
                     lines in the compressed file.
     gzipi repack    Recompress a gzip file and create a new index for it.
 """
+
+
+def _strip_extension(file_path):
+    return file_path.replace('.gz', '').rsplit('.', 1)[0]
 
 
 def _index_subparser(args):
@@ -44,7 +48,7 @@ def _index_subparser(args):
     )
     parser.add_argument(
         '-o', '--index-file', required=False,
-        help='The path to save gzipped output to. If path is not specified, outputs to stdout.'
+        help="The path to save gzipped output to."
     )
     parser.add_argument('--format', required=True, choices=lib.FILE_FORMATS,
                         help='The format of the input file.')
@@ -54,21 +58,42 @@ def _index_subparser(args):
                         help='The delimiter to use for CSV format.')
     parser.add_argument('--field', required=False, default=lib.DEFAULT_JSON_FIELD,
                         help='The name of key field to use for JSON format.')
-    parser.add_argument('--index-lines', action='store_true',
-                        help='If set, indexes lines inside gzip chunks as well.')
 
     args = parser.parse_args(args)
+
+    if isinstance(args.input_file, str) and not P.exists(args.input_file):
+        _LOGGER.error("Input file does not exists: %s", args.input_file)
+        _LOGGER.error("Aborting.")
+        sys.exit(1)
     fin = open(args.input_file, 'rb') if args.input_file else _BINARY_STDIN
+
+    if args.index_file is None and args.input_file:
+        args.index_file = _strip_extension(args.input_file) + _GZIPI_EXTENSION
+
+    if not args.index_file:
+        _LOGGER.error(
+            "Can't determine path for index file. "
+            "Please set it manually via --index-file parameter."
+        )
+        sys.exit(1)
+
     if args.index_file and P.exists(args.index_file):
-        raise ValueError("Output index path already exists: %s" % args.index_file)
-    fout = gzip.open(args.index_file, 'wb') if args.index_file else _BINARY_STDOUT
+        response = input(
+            "Output index path already exists: %s."
+            " Do you want to overwrite it? y/n\n" % args.index_file
+        )
+        if response.lower() not in _CONSENT_STRINGS:
+            _LOGGER.error("Aborting.")
+            sys.exit(1)
+    fout = smart_open.open(args.index_file, 'wb')
 
     if args.format == 'csv':
         lib.index_csv_file(csv_file=fin, output_file=fout, column=args.column,
-                           delimiter=args.delimiter, index_lines=args.index_lines)
+                           delimiter=args.delimiter)
     else:
-        lib.index_json_file(json_file=fin, output_file=fout, field=args.field,
-                            index_lines=args.index_lines)
+        lib.index_json_file(json_file=fin, output_file=fout, field=args.field)
+    fout.close()
+    lib.sort_file(args.index_file)
 
 
 def _retrieve_subparser(args):
@@ -81,41 +106,33 @@ def _retrieve_subparser(args):
     )
     parser.add_argument('-f', '--input-file', required=True,
                         help='The path to input file to scan. May be a local path or an S3 path.')
-    parser.add_argument('-i', '--index-file', required=True,
+    parser.add_argument('-i', '--index-file', required=False,
                         help='The local path to read index data from.')
     parser.add_argument('-o', '--output-file', required=False,
                         help='The path to save gzipped output to. By default, outputs to stdout.')
-    parser.add_argument('--format', required=True, choices=lib.FILE_FORMATS,
-                        help='The format of the input file.')
-    parser.add_argument('--column', type=int, required=False, default=lib.DEFAULT_CSV_COLUMN,
-                        help='The index of key column to use for CSV format.')
-    parser.add_argument('--delimiter', type=str, required=False, default=lib.DEFAULT_CSV_DELIMITER,
-                        help='The delimiter to use for CSV format.')
-    parser.add_argument('--field', required=False, default=lib.DEFAULT_JSON_FIELD,
-                        help='The name of key field to use for JSON format.')
 
     args = parser.parse_args(args)
-    if args.keys:
-        if args.keys.endswith(".gz"):
-            keys_fin = gzip.open(args.keys, 'rb')
-        else:
-            keys_fin = open(args.keys, 'rb')
-    else:
-        keys_fin = _BINARY_STDIN
-    fout = gzip.open(args.output_file, 'wb') if args.output_file else _BINARY_STDOUT
+    if not args.index_file:
+        args.index_file = _strip_extension(args.input_file) + _GZIPI_EXTENSION
 
-    if args.format == 'csv':
-        lib.retrieve_from_csv(
-            keys_fin=keys_fin, csv_path=args.input_file,
-            index_path=args.index_file, output_stream=fout,
-            column=args.column, delimiter=args.delimiter
-        )
-    else:
-        lib.retrieve_from_json(
-            keys_fin=keys_fin, json_path=args.input_file,
-            index_path=args.index_file, output_stream=fout,
-            field=args.field
-        )
+    input_file = args.input_file
+    if input_file and (not input_file.startswith('s3://') and not P.exists(input_file)):
+            _LOGGER.error("Input file does not exists: %s", args.input_file)
+            _LOGGER.error("Aborting.")
+            sys.exit(1)
+
+    if args.keys and not P.exists(args.keys):
+        _LOGGER.error("Keys file does not exists: %s", args.input_file)
+        _LOGGER.error("Aborting.")
+        sys.exit(1)
+
+    keys_fin = smart_open.open(args.keys, mode='rb') if args.keys else _BINARY_STDIN
+    fout = smart_open.open(args.output_file, mode='wb') if args.output_file else _BINARY_STDOUT
+    index_fin = smart_open.open(args.index_file, 'r')
+    lib.retrieve(
+        keys_fin=keys_fin, file_path=args.input_file,
+        index_fin=index_fin, output_stream=fout,
+    )
 
 
 def _repack_subparser(args):
@@ -127,7 +144,7 @@ def _repack_subparser(args):
     )
     parser.add_argument('-o', '--output-file', required=False,
                         help='The path to save recompressed file to.')
-    parser.add_argument('-i', '--index-file', required=True,
+    parser.add_argument('-i', '--index-file', required=False,
                         help='The path to save gzipped index to.')
     parser.add_argument('--format', required=True, choices=lib.FILE_FORMATS,
                         help='The format of the input file.')
@@ -142,7 +159,40 @@ def _repack_subparser(args):
     args = parser.parse_args(args)
 
     fin = open(args.input_file, 'rb') if args.input_file else _BINARY_STDIN
-    index_fout = gzip.open(args.index_file, 'wb')
+    if not args.index_file and args.output_file:
+        args.index_file = _strip_extension(args.output_file) + _GZIPI_EXTENSION
+
+    if isinstance(args.input_file, str) and not P.exists(args.input_file):
+        _LOGGER.error("Input file does not exists: %s", args.input_file)
+        _LOGGER.error("Aborting.")
+        sys.exit(1)
+
+    if not args.index_file:
+        _LOGGER.error(
+            "Can't determine path for index file. "
+            "Please set it manually via --index-file parameter."
+        )
+        sys.exit(1)
+
+    if P.exists(args.index_file):
+        response = input(
+            "Output index path already exists: %s."
+            " Do you want to overwrite it? y/n\n" % args.index_file
+        )
+        if response.lower() not in _CONSENT_STRINGS:
+            _LOGGER.error("Aborting.")
+            sys.exit(1)
+
+    if P.exists(args.output_file):
+        response = input(
+            "Output path already exists: %s."
+            " Do you want to overwrite it? y/n\n" % args.output_file
+        )
+        if response.lower() not in _CONSENT_STRINGS:
+            _LOGGER.error("Aborting.")
+            sys.exit(1)
+
+    index_fout = smart_open.open(args.index_file, 'wb')
     fout = open(args.output_file, 'wb') if args.output_file else _BINARY_STDOUT
 
     if args.format == 'csv':
@@ -157,6 +207,8 @@ def _repack_subparser(args):
             index_fout=index_fout, chunk_size=args.chunk_size,
             field=args.field,
         )
+    fout.close()
+    lib.sort_file(args.index_file)
 
 
 def _create_main_parser():
@@ -173,6 +225,7 @@ def _create_main_parser():
 
 
 def main():
+    logging.basicConfig(level=logging.ERROR)
     _create_main_parser()
 
 

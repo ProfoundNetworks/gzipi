@@ -54,8 +54,8 @@ lint: ## check style with flake8
 	flake8 gzipi tests
 
 test: ## run tests quickly with the default Python
-	pytest tests -W ignore::DeprecationWarning
-	pytest integration-tests -W ignore::DeprecationWarning
+	pytest tests -W ignore::DeprecationWarning -v
+	pytest integration-tests -W ignore::DeprecationWarning -v
 
 test-all: ## run tests on every Python version with tox
 	tox

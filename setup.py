@@ -6,9 +6,9 @@
 from setuptools import setup, find_packages
 
 
-requirements = ['boto3']
+requirements = ['smart-open', 'plumbum']
 setup_requirements = []
-test_requirements = ['pytest', 'flake8']
+test_requirements = ['pytest', 'flake8', ]
 
 setup(
     author="Profound Networks",

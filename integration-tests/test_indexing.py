@@ -23,14 +23,14 @@ def test_indexes_json_file():
 def test_retrieves_indexed_json():
     curr_dir = P.dirname(P.abspath(__file__))
     json_path = P.join(curr_dir,  'data/sample.json.gz')
-    index_path = P.join(curr_dir, 'data/index.json.gz')
+    index_fin = gzip.open(P.join(curr_dir, 'data/index.json.gz'), 'rt')
     keys = io.BytesIO(
         b"95-926-1252\n00-720-2041"
         b"\n17-517-6091\n06-589-6091\n37-510-3515"
     )
     output_file = io.BytesIO()
 
-    gzipi.lib.retrieve_from_json(keys, json_path, index_path, output_file, field='id')
+    gzipi.lib.retrieve(keys, json_path, index_fin, output_file)
     actual = output_file.getvalue()
     expected = open(P.join(curr_dir,  'data/retrieve_expected.json'), 'rb').read()
     assert expected == actual
@@ -49,14 +49,14 @@ def test_indexes_csv_file():
 def test_retrieves_indexed_csv():
     curr_dir = P.dirname(P.abspath(__file__))
     json_path = P.join(curr_dir,  'data/sample.csv.gz')
-    index_path = P.join(curr_dir, 'data/index.csv.gz')
+    index_fin = gzip.open(P.join(curr_dir, 'data/index.csv.gz'), 'rt')
     keys = io.BytesIO(
         b"56-053-2131\n09-530-5619"
         b"\n25-172-0048\n11-111-1148\n20-429-6275"
     )
     output_file = io.BytesIO()
 
-    gzipi.lib.retrieve_from_csv(keys, json_path, index_path, output_file, column=0, delimiter=',')
+    gzipi.lib.retrieve(keys, json_path, index_fin, output_file)
     actual = output_file.getvalue()
     expected = open(P.join(curr_dir,  'data/retrieve_expected.csv'), 'rb').read()
     assert expected == actual
