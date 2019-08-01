@@ -363,14 +363,19 @@ def sort_file(file_path):
 
     :param str file_path: The path to file to sort.
     """
-    sorted_handle, tmp_path = tempfile.mkstemp(prefix='gzippi')
+    sorted_handle, tmp_path = tempfile.mkstemp(prefix='gzipi')
     os.close(sorted_handle)
     shutil.move(file_path, tmp_path)
 
     #
     # We use sort from GNU toolchain here, because index file can be pretty big.
     #
-    sort_flags = ['--parallel=%s' % _SORT_CPU_COUNT, '--buffer-size=%s' % _SORT_BUFFER_SIZE]
+    sort_flags = [
+        '--field-separator=|',
+        '--key=1,1',
+        '--parallel=%s' % _SORT_CPU_COUNT,
+        '--buffer-size=%s' % _SORT_BUFFER_SIZE
+    ]
     gzcat = plumbum.local['gzcat'][tmp_path]
     cat = plumbum.local['cat'][tmp_path]
     gzip_exe = plumbum.local['gzip']['--stdout']
