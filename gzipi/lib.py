@@ -7,8 +7,8 @@
 The main entry points are:
 
 - index_csv_file, index_json_file: Scan a file and create a new index file.
-- retrieve_from_csv,retrieve_from_json: Use a previously created index to quickly
- access individual lines in the compressed file.
+- retrieve: Use a previously created index to quickly
+  access individual lines in the compressed file.
 - repack_json_file, repack_csv_file: Recompress a gzip file and create a new index for it.
 
 Type ``gzipi --help`` in the terminal for more information and CLI examples.
@@ -24,13 +24,15 @@ import json
 import logging
 import multiprocessing
 import os
+import os.path as P
 import shutil
 import struct
 import tempfile
 import time
 
-import plumbum
+import boto3
 import smart_open
+import plumbum
 
 _GZIP_HEADER = b'\x1f\x8b\x08'
 """A magic gzip header and two compression flags.
@@ -168,12 +170,11 @@ def index_csv_file(
     csv_file, output_file, column=DEFAULT_CSV_COLUMN,
     delimiter=DEFAULT_CSV_DELIMITER, min_chunk_size=_MIN_CHUNK_SIZE
 ):
-    """Index a CSV file from the file stream.
+    """Index a gzipped CSV file from the file stream.
 
-    Possible formats of the index file:
+    The format of the index will be::
 
-    key|gzip_start_offset|gzip_length
-    key|gzip_start_offset|gzip_length|line_start_offset|line_length (when index_lines is True)
+        key|gzip_start_offset|gzip_length|line_start_offset|line_length
 
     All offsets are in bytes.
 
@@ -203,7 +204,7 @@ def index_csv_file(
 
 def index_json_file(json_file, output_file, field=DEFAULT_JSON_FIELD,
                     min_chunk_size=_MIN_CHUNK_SIZE):
-    """Index a JSON file from the file stream.
+    """Index a gzipped JSON file from the file stream.
 
     Format of the index file:
 
@@ -295,8 +296,7 @@ def retrieve(keys_fin, file_path, index_fin, output_stream):
     :param file output_stream: A file stream to output results to.
     """
 
-    transport_params = {'resource_kwargs': {'endpoint_url': 'http://127.0.0.1:9000'}}
-    input_fin = smart_open.open(file_path, 'rb', transport_params=transport_params, ignore_ext=True)
+    input_fin = smart_open.open(file_path, 'rb', ignore_ext=True)
     for keys in _batch_iterator(keys_fin, decode_lines=True):
         keys_idx = _scan_index(keys, index_fin)
         displayed = set()
@@ -315,6 +315,86 @@ def retrieve(keys_fin, file_path, index_fin, output_stream):
                     if domain in displayed:
                         _LOGGER.error("multiple matches for %s key")
                     displayed.add(domain)
+
+
+def _start_of_line(fin, lineterminator=b'\n'):
+    """Moves the file pointer back to the start of the current line."""
+    while True:
+        if fin.tell() == 0:
+            break
+
+        fin.seek(-1, io.SEEK_CUR)
+        curr_byte = fin.read(1)
+        if curr_byte == lineterminator:
+            break
+
+        fin.seek(-1, io.SEEK_CUR)
+
+
+def _binary_search(key, fin, fsize, delimiter=b'|', lineterminator=b'\n'):
+    seen = set()
+    start, pivot, end = 0, fsize // 2, fsize
+
+    while True:
+        #
+        # The assertion will trip if there is a bug in the code, or if the
+        # index isn't sorted properly.
+        #
+        assert (start, pivot, end) not in seen, 'stuck in an infinite loop'
+        seen.add((start, pivot, end))
+
+        fin.seek(pivot)
+        _start_of_line(fin)
+
+        line = fin.readline()
+
+        candidate, rest = line.split(delimiter, 1)
+
+        if candidate == key:
+            return rest.rstrip(lineterminator).split(delimiter)
+        elif fin.tell() == fsize:
+            #
+            # Reached EOF
+            #
+            raise KeyError(key)
+        elif key < candidate:
+            start, pivot, end = start, (pivot + start) // 2, pivot
+        else:
+            start, pivot, end = pivot, (pivot + end) // 2, end
+
+
+def _getsize(path):
+    """Return the size of an object, in bytes.
+
+    Works for both S3 and local objects.
+    """
+    if path.startswith('s3://'):
+        parsed_uri = smart_open.smart_open_lib._parse_uri(path)
+
+        session = boto3.Session()
+        s3 = session.resource('s3')
+        obj = s3.Object(parsed_uri.bucket_id, parsed_uri.key_id)
+        return obj.get()['Content-Length']
+    else:
+        return P.getsize(path)
+
+
+def search(key, file_path, index_path, output_stream):
+    fsize = _getsize(index_path)
+    with open(index_path, 'rb') as fin:
+        chunk_offset, chunk_len, line_offset, line_len = _binary_search(key, fin, fsize)
+
+    chunk_offset = int(chunk_offset)
+    chunk_len = int(chunk_len)
+    line_offset = int(line_offset)
+    line_len = int(line_len)
+
+    with smart_open.open(file_path, 'rb', ignore_ext=True) as fin:
+        fin.seek(chunk_offset)
+        gzip_chunk = io.BytesIO(fin.read(chunk_len))
+        with gzip.open(gzip_chunk, 'rb') as inner_fin:
+            inner_fin.seek(line_offset)
+            output_stream.write(inner_fin.read(line_len))
 
 
 def _extract_keys_from_json(line, field):

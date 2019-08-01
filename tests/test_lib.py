@@ -34,3 +34,29 @@ class IterateArchivestest(unittest.TestCase):
             for chunk in gzipi.lib._iterate_archives(buf, buffer_size=15)
         ]
         self.assertEqual(expected, actual)
+
+
+class BinarySearchTest(unittest.TestCase):
+    def setUp(self):
+        self.fin = io.BytesIO(
+            b"a|1\n"
+            b"b|2\n"
+            b"c|3\n"
+        )
+        self.fsize = len(self.fin.getvalue())
+
+    def test_start(self):
+        actual = gzipi.lib._binary_search(b'a', self.fin, self.fsize)
+        self.assertEqual([b'1'], actual)
+
+    def test_middle(self):
+        actual = gzipi.lib._binary_search(b'b', self.fin, self.fsize)
+        self.assertEqual([b'2'], actual)
+
+    def test_end(self):
+        actual = gzipi.lib._binary_search(b'c', self.fin, self.fsize)
+        self.assertEqual([b'3'], actual)
+
+    def test_missing(self):
+        with self.assertRaises(KeyError):
+            gzipi.lib._binary_search(b'd', self.fin, self.fsize)

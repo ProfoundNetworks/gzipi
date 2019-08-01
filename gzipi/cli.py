@@ -25,12 +25,16 @@ _LOGGER = logging.getLogger(__name__)
 _BINARY_STDIN, _BINARY_STDOUT = sys.stdin.buffer, sys.stdout.buffer
 _GZIPI_EXTENSION = '.gzi'
 _CONSENT_STRINGS = ('y', 'yes')
+_ENCODING = 'utf-8'
 _CLI_DESCRIPTION = """gzipi  <command> [<args>]
 
 Available commands:
     gzipi index     Scan a file to create a new index.
     gzipi retrieve  Use a previously created index to quickly access individual
-                    lines in the compressed file.
+                    lines in the compressed file.  Loads the index into memory.
+    gzipi search    Use a previously created index to quickly access a single
+                    line in the compressed file.  Performs a binary search on
+                    the index, which must be sorted on the key.
     gzipi repack    Recompress a gzip file and create a new index for it.
 """
 
@@ -61,11 +65,15 @@ def _index_subparser(args):
 
     args = parser.parse_args(args)
 
-    if isinstance(args.input_file, str) and not P.exists(args.input_file):
-        _LOGGER.error("Input file does not exists: %s", args.input_file)
+    if isinstance(args.input_file, str) and not _exists(args.input_file):
+        _LOGGER.error("Input file does not exist: %s", args.input_file)
         _LOGGER.error("Aborting.")
         sys.exit(1)
-    fin = open(args.input_file, 'rb') if args.input_file else _BINARY_STDIN
+
+    if args.input_file:
+        fin = smart_open.open(args.input_file, 'rb', ignore_ext=True)
+    else:
+        fin = _BINARY_STDIN
 
     if args.index_file is None and args.input_file:
         args.index_file = _strip_extension(args.input_file) + _GZIPI_EXTENSION
@@ -77,7 +85,7 @@ def _index_subparser(args):
         )
         sys.exit(1)
 
-    if args.index_file and P.exists(args.index_file):
+    if args.index_file and _exists(args.index_file):
         response = input(
             "Output index path already exists: %s."
             " Do you want to overwrite it? y/n\n" % args.index_file
@@ -85,6 +93,7 @@ def _index_subparser(args):
         if response.lower() not in _CONSENT_STRINGS:
             _LOGGER.error("Aborting.")
             sys.exit(1)
+
     fout = smart_open.open(args.index_file, 'wb')
 
     if args.format == 'csv':
@@ -116,23 +125,63 @@ def _retrieve_subparser(args):
         args.index_file = _strip_extension(args.input_file) + _GZIPI_EXTENSION
 
     input_file = args.input_file
-    if input_file and (not input_file.startswith('s3://') and not P.exists(input_file)):
-        _LOGGER.error("Input file does not exists: %s", args.input_file)
+    if input_file and not _exists(input_file):
+        _LOGGER.error("Input file does not exist: %s", args.input_file)
         _LOGGER.error("Aborting.")
         sys.exit(1)
 
     if args.keys and not P.exists(args.keys):
-        _LOGGER.error("Keys file does not exists: %s", args.input_file)
+        _LOGGER.error("Keys file does not exist: %s", args.input_file)
         _LOGGER.error("Aborting.")
         sys.exit(1)
 
     keys_fin = smart_open.open(args.keys, mode='rb') if args.keys else _BINARY_STDIN
-    fout = smart_open.open(args.output_file, mode='wb') if args.output_file else _BINARY_STDOUT
+
+    if args.output_file:
+        fout = smart_open.open(args.output_file, mode='wb', ignore_ext=True)
+    else:
+        fout = _BINARY_STDOUT
+
     index_fin = smart_open.open(args.index_file, 'r')
     lib.retrieve(
         keys_fin=keys_fin, file_path=args.input_file,
         index_fin=index_fin, output_stream=fout,
     )
+
+
+def _search_subparser(args):
+    desc = 'Look up a single key in the index, and retrieve the corresponding line'
+
+    parser = argparse.ArgumentParser(description=desc)
+    parser.add_argument('-k', '--key', required=True, help='The key to look up')
+    parser.add_argument('-f', '--input-file', required=True,
+                        help='The path to input file to scan. May be a local path or an S3 path.')
+    parser.add_argument('-i', '--index-file', required=False,
+                        help='The local path to read index data from.')
+    parser.add_argument('-o', '--output-file', required=False,
+                        help='The path to save gzipped output to. By default, outputs to stdout.')
+    args = parser.parse_args(args)
+
+    if not args.index_file:
+        args.index_file = _strip_extension(args.input_file) + _GZIPI_EXTENSION
+
+    fout = smart_open.open(args.output_file, mode='wb') if args.output_file else _BINARY_STDOUT
+
+    key = args.key.encode(_ENCODING)
+    lib.search(key, args.input_file, args.index_file, fout)
+
+
+def _exists(path):
+    if path.startswith('s3://'):
+        try:
+            with smart_open.open(path, 'rb', ignore_ext=True) as fin:
+                fin.read(1)
+        except IOError:
+            return False
+        else:
+            return True
+    else:
+        return P.exists(path)
 
 
 def _repack_subparser(args):
@@ -158,12 +207,16 @@ def _repack_subparser(args):
                         help='The number of lines to pack in a single gzip chunk.')
     args = parser.parse_args(args)
 
-    fin = open(args.input_file, 'rb') if args.input_file else _BINARY_STDIN
+    if args.input_file:
+        fin = smart_open.open(args.input_file, 'rb', ignore_ext=True)
+    else:
+        fin = _BINARY_STDIN
+
     if not args.index_file and args.output_file:
         args.index_file = _strip_extension(args.output_file) + _GZIPI_EXTENSION
 
-    if isinstance(args.input_file, str) and not P.exists(args.input_file):
-        _LOGGER.error("Input file does not exists: %s", args.input_file)
+    if isinstance(args.input_file, str) and not _exists(args.input_file):
+        _LOGGER.error("Input file does not exist: %s", args.input_file)
         _LOGGER.error("Aborting.")
         sys.exit(1)
 
@@ -193,7 +246,11 @@ def _repack_subparser(args):
             sys.exit(1)
 
     index_fout = smart_open.open(args.index_file, 'wb')
-    fout = open(args.output_file, 'wb') if args.output_file else _BINARY_STDOUT
+
+    if args.output_file:
+        fout = smart_open.open(args.output_file, 'wb', ignore_ext=True)
+    else:
+        fout = _BINARY_STDOUT
 
     if args.format == 'csv':
         lib.repack_csv_file(
