@@ -16,6 +16,7 @@ Type ``gzipi --help`` in the terminal for more information and CLI examples.
 
 import collections
 import csv
+import distutils.spawn
 import functools
 import gzip
 import io
@@ -374,7 +375,7 @@ def sort_file(file_path):
     gzcat = plumbum.local['gzcat'][tmp_path]
     cat = plumbum.local['cat'][tmp_path]
     gzip_exe = plumbum.local['gzip']['--stdout']
-    sort = plumbum.local['gsort'][sort_flags]
+    sort = plumbum.local[get_exe('gsort', 'sort')][sort_flags]
 
     file_path = os.path.abspath(file_path)
     is_gzipped = file_path.endswith('.gz')
@@ -398,3 +399,14 @@ def repack_csv_file(fin, fout, index_fout, chunk_size, column=DEFAULT_CSV_COLUMN
                     delimiter=DEFAULT_CSV_DELIMITER):
     extractor = functools.partial(_extract_keys_from_csv, column=column, delimiter=delimiter)
     return _repack(fin, fout, index_fout, chunk_size, extractor)
+
+
+def get_exe(*preference):
+    """Return the path to the full executable, given a list of candidates.
+
+    The list should be in order of decreasing preference.
+    """
+    for exe in preference:
+        path = distutils.spawn.find_executable(exe)
+        if path:
+            return path
