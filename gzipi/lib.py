@@ -304,9 +304,8 @@ def retrieve(keys_fin, file_path, index_fin, output_stream):
             index = group[0]
             start_offset, offset_length = int(index[1]), int(index[2])
             input_fin.seek(start_offset)
-            gzip_chunk = io.BytesIO()
-            gzip_chunk.write(input_fin.read(offset_length))
-            gzip_chunk.seek(0)
+
+            gzip_chunk = io.BytesIO(input_fin.read(offset_length))
             with gzip.open(gzip_chunk, 'rb') as gzip_fin:
                 for row in group:
                     gzip_fin.seek(int(row[3]))

@@ -117,9 +117,9 @@ def _retrieve_subparser(args):
 
     input_file = args.input_file
     if input_file and (not input_file.startswith('s3://') and not P.exists(input_file)):
-            _LOGGER.error("Input file does not exists: %s", args.input_file)
-            _LOGGER.error("Aborting.")
-            sys.exit(1)
+        _LOGGER.error("Input file does not exists: %s", args.input_file)
+        _LOGGER.error("Aborting.")
+        sys.exit(1)
 
     if args.keys and not P.exists(args.keys):
         _LOGGER.error("Keys file does not exists: %s", args.input_file)
@@ -212,7 +212,7 @@ def _repack_subparser(args):
 
 
 def _create_main_parser():
-    parser = argparse.ArgumentParser(description='gzippi command-line interface',
+    parser = argparse.ArgumentParser(description='gzipi command-line interface',
                                      usage=_CLI_DESCRIPTION)
     parser.add_argument('command', help='Subcommand to run')
     args = parser.parse_args(sys.argv[1:2])
