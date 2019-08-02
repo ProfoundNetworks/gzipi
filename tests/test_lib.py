@@ -36,6 +36,35 @@ class IterateArchivestest(unittest.TestCase):
         self.assertEqual(expected, actual)
 
 
+class StartOfLineTest(unittest.TestCase):
+    def setUp(self):
+        self.fin = io.BytesIO(b'one\ntwo\nthree\nfour\nfive\nsix\nseven')
+
+    def test_start(self):
+        self.fin.seek(2)
+        gzipi.lib._start_of_line(self.fin)
+
+        expected = b'one\n'
+        actual = self.fin.readline()
+        self.assertEqual(expected, actual)
+
+    def test_middle(self):
+        self.fin.seek(10)
+        gzipi.lib._start_of_line(self.fin)
+
+        expected = b'three\n'
+        actual = self.fin.readline()
+        self.assertEqual(expected, actual)
+
+    def test_end(self):
+        self.fin.read()
+        gzipi.lib._start_of_line(self.fin)
+
+        expected = b'seven'
+        actual = self.fin.readline()
+        self.assertEqual(expected, actual)
+
+
 class BinarySearchTest(unittest.TestCase):
     def setUp(self):
         self.fin = io.BytesIO(

@@ -317,18 +317,31 @@ def retrieve(keys_fin, file_path, index_fin, output_stream):
                     displayed.add(domain)
 
 
-def _start_of_line(fin, lineterminator=b'\n'):
+def _start_of_line(fin, lineterminator=b'\n', bufsize=io.DEFAULT_BUFFER_SIZE):
     """Moves the file pointer back to the start of the current line."""
     while True:
-        if fin.tell() == 0:
+        current_pos = fin.tell()
+        if current_pos == 0:
             break
 
-        fin.seek(-1, io.SEEK_CUR)
-        curr_byte = fin.read(1)
-        if curr_byte == lineterminator:
-            break
+        seek_pos = max(0, current_pos - bufsize)
+        fin.seek(seek_pos)
+        buf = fin.read(current_pos - seek_pos)
 
-        fin.seek(-1, io.SEEK_CUR)
+        assert fin.tell() == current_pos, 'we should be back at current_pos'
+
+        if lineterminator in buf:
+            index = max([i for (i, c) in enumerate(buf) if c == ord(lineterminator)])
+            fin.seek(seek_pos + index + 1)
+            break
+        elif bufsize < current_pos:
+            #
+            # Try again with a larger lookbehind buffer.
+            #
+            bufsize *= 2
+        else:
+            fin.seek(0)
+            break
 
 
 def _binary_search(key, fin, fsize, delimiter=b'|', lineterminator=b'\n'):
@@ -374,14 +387,14 @@ def _getsize(path):
         session = boto3.Session()
         s3 = session.resource('s3')
         obj = s3.Object(parsed_uri.bucket_id, parsed_uri.key_id)
-        return obj.get()['Content-Length']
+        return obj.get()['ContentLength']
     else:
         return P.getsize(path)
 
 
 def search(key, file_path, index_path, output_stream):
     fsize = _getsize(index_path)
-    with open(index_path, 'rb') as fin:
+    with smart_open.open(index_path, 'rb') as fin:
         chunk_offset, chunk_len, line_offset, line_len = _binary_search(key, fin, fsize)
 
     chunk_offset = int(chunk_offset)
