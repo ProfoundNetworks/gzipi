@@ -362,6 +362,10 @@ def _binary_search(key, fin, fsize, delimiter=b'|', lineterminator=b'\n'):
         line = fin.readline()
 
         candidate, rest = line.split(delimiter, 1)
+        _LOGGER.debug(
+            'start: %r pivot: %r end: %r candidate: %r',
+            start, pivot, end, candidate,
+        )
 
         if candidate == key:
             return rest.rstrip(lineterminator).split(delimiter)

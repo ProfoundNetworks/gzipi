@@ -43,9 +43,9 @@ def _strip_extension(file_path):
     return file_path.replace('.gz', '').rsplit('.', 1)[0]
 
 
-def _index_subparser(args):
+def _index_subparser(subparsers):
     desc = 'Scan a file to create a new index.'
-    parser = argparse.ArgumentParser(description=desc)
+    parser = subparsers.add_parser('index', description=desc, help=desc)
     parser.add_argument(
         '-i', '--input-file', required=False,
         help='The path to the file to index. If path is not specified, reads from stdin.'
@@ -62,9 +62,10 @@ def _index_subparser(args):
                         help='The delimiter to use for CSV format.')
     parser.add_argument('--field', required=False, default=lib.DEFAULT_JSON_FIELD,
                         help='The name of key field to use for JSON format.')
+    parser.set_defaults(function=_index)
 
-    args = parser.parse_args(args)
 
+def _index(args):
     if isinstance(args.input_file, str) and not _exists(args.input_file):
         _LOGGER.error("Input file does not exist: %s", args.input_file)
         _LOGGER.error("Aborting.")
@@ -105,9 +106,9 @@ def _index_subparser(args):
     lib.sort_file(args.index_file)
 
 
-def _retrieve_subparser(args):
+def _retrieve_subparser(subparsers):
     desc = 'Scan a file for a provided list of keys given an index file.'
-    parser = argparse.ArgumentParser(description=desc)
+    parser = subparsers.add_parser('retrieve', description=desc, help=desc)
     parser.add_argument(
         '-k', '--keys', required=False,
         help='The path to the key strings (e.g. domains) to scan the input file for. '
@@ -119,8 +120,10 @@ def _retrieve_subparser(args):
                         help='The local path to read index data from.')
     parser.add_argument('-o', '--output-file', required=False,
                         help='The path to save gzipped output to. By default, outputs to stdout.')
+    parser.set_defaults(function=_retrieve)
 
-    args = parser.parse_args(args)
+
+def _retrieve(args):
     if not args.index_file:
         args.index_file = _strip_extension(args.input_file) + _GZIPI_EXTENSION
 
@@ -149,10 +152,10 @@ def _retrieve_subparser(args):
     )
 
 
-def _search_subparser(args):
+def _search_subparser(subparsers):
     desc = 'Look up a single key in the index, and retrieve the corresponding line'
 
-    parser = argparse.ArgumentParser(description=desc)
+    parser = subparsers.add_parser('search', description=desc, help=desc)
     parser.add_argument('-k', '--key', required=True, help='The key to look up')
     parser.add_argument('-f', '--input-file', required=True,
                         help='The path to input file to scan. May be a local path or an S3 path.')
@@ -160,8 +163,10 @@ def _search_subparser(args):
                         help='The local path to read index data from.')
     parser.add_argument('-o', '--output-file', required=False,
                         help='The path to save gzipped output to. By default, outputs to stdout.')
-    args = parser.parse_args(args)
+    parser.set_defaults(function=_search)
 
+
+def _search(args):
     if not args.index_file:
         args.index_file = _strip_extension(args.input_file) + _GZIPI_EXTENSION
 
@@ -184,9 +189,9 @@ def _exists(path):
         return P.exists(path)
 
 
-def _repack_subparser(args):
+def _repack_subparser(subparsers):
     desc = 'Repack a gzipped file into a chunked gzipped file and an index file.'
-    parser = argparse.ArgumentParser(description=desc)
+    parser = subparsers.add_parser('repack', description=desc, help=desc)
     parser.add_argument(
         '-f', '--input-file', required=False,
         help='The path to the input file to repack. If file is not specified, reads from stdin.'
@@ -205,8 +210,10 @@ def _repack_subparser(args):
                         help='The name of key field to use for JSON format.')
     parser.add_argument('--chunk-size', required=False, default=lib.DEFAULT_CHUNK_SIZE,
                         help='The number of lines to pack in a single gzip chunk.')
-    args = parser.parse_args(args)
+    parser.set_defaults(function=_repack)
 
+
+def _repack(args):
     if args.input_file:
         fin = smart_open.open(args.input_file, 'rb', ignore_ext=True)
     else:
@@ -268,22 +275,41 @@ def _repack_subparser(args):
     lib.sort_file(args.index_file)
 
 
-def _create_main_parser():
+def _create_parser():
     parser = argparse.ArgumentParser(description='gzipi command-line interface',
                                      usage=_CLI_DESCRIPTION)
-    parser.add_argument('command', help='Subcommand to run')
-    args = parser.parse_args(sys.argv[1:2])
-    subparser = '_%s_subparser' % args.command
-    if subparser not in globals():
-        print('Unrecognized command: %r' % args.command)
-        parser.print_help()
-        return
-    return globals()[subparser](sys.argv[2:])
+    parser.add_argument(
+        '-l', '--loglevel', default=logging.ERROR,
+        help='Set the minimum level for log messages'
+    )
+
+    subparsers = parser.add_subparsers(help='sub-command --help')
+
+    functions = [v for (k, v) in globals().items() if k.endswith('_subparser')]
+    for func in sorted(functions, key=lambda f: f.__name__):
+        func(subparsers)
+
+    return parser
 
 
 def main():
-    logging.basicConfig(level=logging.ERROR)
-    _create_main_parser()
+    parser = _create_parser()
+    args = parser.parse_args()
+
+    logging.basicConfig(level=args.loglevel)
+    logging.getLogger('boto3').setLevel(logging.ERROR)
+    logging.getLogger('botocore').setLevel(logging.ERROR)
+    logging.getLogger('urllib3').setLevel(logging.ERROR)
+    logging.getLogger('smart_open').setLevel(logging.ERROR)
+
+    logging.debug('args: %r', args)
+
+    try:
+        function = args.function
+    except AttributeError:
+        parser.error('try --help')
+    else:
+        function(args)
 
 
 if __name__ == '__main__':
