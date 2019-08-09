@@ -397,6 +397,13 @@ def _getsize(path):
 
 
 def search(key, file_path, index_path, output_stream):
+    """Look up a single key in the index, and retrieve the corresponding line.
+
+    :param bytes key: The key to search for.
+    :param str file_path: A local or S3 path to the file retrieve data from.
+    :param str index_path: A local or S3 path to the index file.
+    :param str output_stream: The stream to output result to.
+    """
     fsize = _getsize(index_path)
     with smart_open.open(index_path, 'rb') as fin:
         chunk_offset, chunk_len, line_offset, line_len = _binary_search(key, fin, fsize)
@@ -473,7 +480,7 @@ def sort_file(file_path):
         '--parallel=%s' % _SORT_CPU_COUNT,
         '--buffer-size=%s' % _SORT_BUFFER_SIZE
     ]
-    gzcat = plumbum.local['gzcat'][tmp_path]
+    gzcat = plumbum.local[get_exe('gzcat', 'zcat')][tmp_path]
     cat = plumbum.local['cat'][tmp_path]
     gzip_exe = plumbum.local['gzip']['--stdout']
     sort = plumbum.local[get_exe('gsort', 'sort')][sort_flags]
