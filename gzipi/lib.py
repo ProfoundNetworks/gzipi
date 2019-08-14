@@ -27,6 +27,7 @@ import os
 import os.path as P
 import shutil
 import struct
+import sys
 import tempfile
 import time
 
@@ -93,6 +94,8 @@ _SORT_BUFFER_SIZE = '1G'
 
 _LOGGER = logging.getLogger(__name__)
 _LOGGER.addHandler(logging.NullHandler())
+
+csv.field_size_limit(sys.maxsize)
 
 
 def _is_valid_gzip_header(gzip_header):
