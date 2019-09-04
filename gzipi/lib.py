@@ -2,16 +2,52 @@
 # -*- coding: utf-8 -*-
 # (C) Copyright: Profound Networks, LLC 2019
 #
-"""Main module that implements gzip indexing and searching.
+"""Implements gzip indexing, repacking and searching.
 
-The main entry points are:
+Background
+----------
+
+Ordinary gzip files are not searchable.  You have to read the file from the
+beginning until you find the required record.
+
+``gzipi`` works on gzipped CSV and JSON files, expecting the files to contain a
+single *record* per line.  Each record consists of multiple columns, in the
+case of CSV, or fields, in the case of JSON.  ``gzipi`` picks one of these
+columns/fields as the **index key**.
+
+Using ``gzipi``
+---------------
+
+Before you can use ``gzipi`` to search your gzipped CSV or JSON files, you must
+**repack** them.  Repacking break ordinary gzip files into multiple chunks,
+where each chunk is like an ordinary gzip file.  While doing this, ``gzipi``
+builds an index, keeping track of chunks and keys.  More specifically, for each
+key, the index will contain:
+
+ - ``gzip_start_offset``: the start of chunk that contains the key
+ - ``gzip_length``: the length of the chunk
+ - ``line_start_offset``: the start of the CSV/JSON record, relative to the
+   beginning of the chunk
+ - ``line_length``: the length of the record.
+
+All offsets and lengths are in bytes.
+The index is therefore CSV in the following format::
+
+    key|gzip_start_offset|gzip_length|line_start_offset|line_length
+
+Finally, ``gzipi`` concatenates all the chunks to create the repacked file.
+This repacked file is fully compatible with the ``gzip`` family of tools, and
+behaves like the original gzipped CSV or JSON file.
+
+The main entry points of this module are:
 
 - index_csv_file, index_json_file: Scan a file and create a new index file.
-- retrieve: Use a previously created index to quickly
-  access individual lines in the compressed file.
-- repack_json_file, repack_csv_file: Recompress a gzip file and create a new index for it.
+- repack_json_file, repack_csv_file: Recompress a gzip file and create a new
+  index for it.
+- search: Look up a single key in the index.
+- retrieve: Use a previously created index to quickly access individual lines
+  in the compressed file.
 
-Type ``gzipi --help`` in the terminal for more information and CLI examples.
 """
 
 import collections
@@ -65,11 +101,18 @@ _MIN_CHUNK_SIZE = 100000
 If this value is larger than the actual minimum size, it's possible that two chunks
 will be joined into one.
 """
+
 FILE_FORMATS = ('csv', 'json')
 """Supported file formats."""
+
 DEFAULT_CSV_COLUMN = 0
+"""The number of the column to use for indexing CSV."""
+
 DEFAULT_CSV_DELIMITER = '|'
+"""The character used for delimiting CSV columns."""
+
 DEFAULT_JSON_FIELD = 'domain'
+"""The field to use when indexing JSON."""
 
 _OLDEST_UNIX_TIMESTAMP = 1262307600
 """All Unix timestamps in the gzip header that are smaller than this value are treated as malformed.
@@ -86,6 +129,7 @@ _TEXT_ENCODING = "utf-8"
 
 DEFAULT_CHUNK_SIZE = 5000
 """The number of lines to pack in a single gzip chunk."""
+
 _MAX_RECORDS_PER_BATCH = 5000
 """The maximum number of records to retrieve in a single batch."""
 
@@ -175,12 +219,6 @@ def index_csv_file(
 ):
     """Index a gzipped CSV file from the file stream.
 
-    The format of the index will be::
-
-        key|gzip_start_offset|gzip_length|line_start_offset|line_length
-
-    All offsets are in bytes.
-
     :param stream csv_file: The binary file stream to read input from.
     :param stream output_file: The binary file stream to write output to.
     :param int column: The index of the key column in the input file.
@@ -208,12 +246,6 @@ def index_csv_file(
 def index_json_file(json_file, output_file, field=DEFAULT_JSON_FIELD,
                     min_chunk_size=_MIN_CHUNK_SIZE):
     """Index a gzipped JSON file from the file stream.
-
-    Format of the index file:
-
-        key|gzip_start_offset|gzip_length|line_start_offset|line_length
-
-    All offsets are in bytes.
 
     :param stream json_file: The binary file stream to read input from.
     :param stream output_file: The binary file stream to write output to.
@@ -502,12 +534,29 @@ def sort_file(file_path):
 
 
 def repack_json_file(fin, fout, index_fout, chunk_size, field=DEFAULT_JSON_FIELD):
+    """Repack a JSON file.
+
+    :param file fin: A gzip-compressed binary file stream to read from.  Must contain JSON.
+    :param file fout: A gzip-compressed binary file stream to write to.
+    :param file index_fout: A **text** file stream to write the index to.
+    :param int chunk_size: The number of lines to include in each chunk.
+    :param str field: The field to use when creating the index.
+    """
     extractor = functools.partial(_extract_keys_from_json, field=field)
     return _repack(fin, fout, index_fout, chunk_size, extractor)
 
 
 def repack_csv_file(fin, fout, index_fout, chunk_size, column=DEFAULT_CSV_COLUMN,
                     delimiter=DEFAULT_CSV_DELIMITER):
+    """Repack a CSV file.
+
+    :param file fin: A gzip-compressed binary file stream to read from.  Must contain CSV.
+    :param file fout: A gzip-compressed binary file stream to write to.
+    :param file index_fout: A **text** file stream to write the index to.
+    :param int chunk_size: The number of lines to include in each chunk.
+    :param str column: The index of the column to use when creating the index.
+    :param str delimiter: The CSV column delimiter.
+    """
     extractor = functools.partial(_extract_keys_from_csv, column=column, delimiter=delimiter)
     return _repack(fin, fout, index_fout, chunk_size, extractor)
 
