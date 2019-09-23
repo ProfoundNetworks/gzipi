@@ -68,6 +68,7 @@ import tempfile
 import time
 
 import boto3
+import botocore.exceptions
 import smart_open
 import plumbum
 
@@ -439,7 +440,12 @@ def search(key, file_path, index_path, output_stream):
     :param str index_path: A local or S3 path to the index file.
     :param str output_stream: The stream to output result to.
     """
-    fsize = _getsize(index_path)
+    try:
+        fsize = _getsize(index_path)
+    except (FileNotFoundError, botocore.exceptions.BotoCoreError) as err:
+        _LOGGER.error("Can't open index file: %s", err)
+        sys.exit(1)
+
     with smart_open.open(index_path, 'rb') as fin:
         chunk_offset, chunk_len, line_offset, line_len = _binary_search(key, fin, fsize)
 
@@ -448,7 +454,13 @@ def search(key, file_path, index_path, output_stream):
     line_offset = int(line_offset)
     line_len = int(line_len)
 
-    with smart_open.open(file_path, 'rb', ignore_ext=True) as fin:
+    try:
+        fin = smart_open.open(file_path, 'rb', ignore_ext=True)
+    except (FileNotFoundError, botocore.exceptions.BotoCoreError) as err:
+        _LOGGER.error("Can't open data file: %s", err)
+        sys.exit(1)
+
+    with fin:
         fin.seek(chunk_offset)
         gzip_chunk = io.BytesIO(fin.read(chunk_len))
         with gzip.open(gzip_chunk, 'rb') as inner_fin:
