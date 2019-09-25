@@ -89,7 +89,7 @@ def _index(args):
     if args.index_file and _exists(args.index_file):
         response = input(
             "Output index path already exists: %s."
-            " Do you want to overwrite it? y/n\n" % args.index_file
+            " Do you want to overwrite it? y/n\n" % str(args.index_file)
         )
         if response.lower() not in _CONSENT_STRINGS:
             _LOGGER.error("Aborting.")
@@ -153,7 +153,8 @@ def _retrieve(args):
 
 
 def _search_subparser(subparsers):
-    desc = 'Look up a single key in the index, and retrieve the corresponding line'
+    desc = 'Look up a single key in the index, and retrieve the corresponding line. '\
+           'Exits with exit code #1 in case the key was not found.'
 
     parser = subparsers.add_parser('search', description=desc, help=desc)
     parser.add_argument('-k', '--key', required=True, help='The key to look up')
@@ -173,7 +174,11 @@ def _search(args):
     fout = smart_open.open(args.output_file, mode='wb') if args.output_file else _BINARY_STDOUT
 
     key = args.key.encode(_ENCODING)
-    lib.search(key, args.input_file, args.index_file, fout)
+    try:
+        lib.search(key, args.input_file, args.index_file, fout)
+    except KeyError:
+        _LOGGER.error("Can't look up %s key in the index file." % args.key)
+        sys.exit(1)
 
 
 def _exists(path):
