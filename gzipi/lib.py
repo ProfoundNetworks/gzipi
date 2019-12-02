@@ -68,6 +68,7 @@ import tempfile
 import time
 
 import boto3
+import botocore.exceptions
 import smart_open
 import plumbum
 
@@ -140,6 +141,11 @@ _LOGGER = logging.getLogger(__name__)
 _LOGGER.addHandler(logging.NullHandler())
 
 csv.field_size_limit(sys.maxsize)
+
+_DEFAULT_BUFFER_SIZE = 1024
+"""The maximum size of the index file to load in memory when performing binary search, in KiB."""
+
+_BYTES_IN_KiB = 1024
 
 
 def _is_valid_gzip_header(gzip_header):
@@ -379,9 +385,58 @@ def _start_of_line(fin, lineterminator=b'\n', bufsize=io.DEFAULT_BUFFER_SIZE):
             break
 
 
-def _binary_search(key, fin, fsize, delimiter=b'|', lineterminator=b'\n'):
+def _buffer_chunk(fin, start, end, pivot, lineterminator):
+    #
+    # This function reads a specified chunk into memory to avoid hitting disk or network
+    # storage on every seek/read call. We use it when the search scope is relatively small.
+    #
+    # When buffered, the binary search algorithm won't have access to the rest of the file.
+    # Because of that, it's important to ensure that we keep complete lines at the start
+    # and end of the chunk.
+    #
+
+    fin.seek(start)
+    _start_of_line(fin)
+    left_shift = start - fin.tell()
+    size = (end - start) + left_shift
+    buf = io.BytesIO(fin.read(size))
+
+    buf.seek(-1, io.SEEK_END)
+    if buf.read() != lineterminator:
+        buf.seek(0, io.SEEK_END)
+        buf.write(fin.readline())
+
+    size = buf.getbuffer().nbytes
+    pivot = pivot - start + left_shift
+    start, end = 0, size
+
+    buf.seek(0)
+    return buf, start, end, pivot
+
+
+def _is_last_line(fin, start, end):
+    current_pos = fin.tell()
+    fin.seek(start)
+    data = fin.read(end - start)
+    #
+    # It's possible to be in the middle of two last lines.
+    #
+    if data.count(b'\n') == 0:
+        return True
+    else:
+        fin.seek(current_pos)
+        return False
+
+
+def _binary_search(key, fin, fsize, delimiter=b'|', lineterminator=b'\n',
+                   buffer_size=_DEFAULT_BUFFER_SIZE):
     seen = set()
     start, pivot, end = 0, fsize // 2, fsize
+    buffered = False
+
+    if fsize < buffer_size * _BYTES_IN_KiB:
+        fin = io.BytesIO(fin.read())
+        buffered = True
 
     while True:
         #
@@ -409,10 +464,20 @@ def _binary_search(key, fin, fsize, delimiter=b'|', lineterminator=b'\n'):
             # Reached EOF
             #
             raise KeyError(key)
+        elif buffered and fin.tell() > end and _is_last_line(fin, start, end):
+            raise KeyError(key)
         elif key < candidate:
             start, pivot, end = start, (pivot + start) // 2, pivot
         else:
             start, pivot, end = pivot, (pivot + end) // 2, end
+
+        if not buffered and end - start < buffer_size * _BYTES_IN_KiB:
+            #
+            # Download the entire search scope to an internal in-memory buffer to reduce the number
+            # of disk or network seek/read operations.
+            #
+            fin, start, end, pivot = _buffer_chunk(fin, start, end, pivot, lineterminator)
+            buffered = True
 
 
 def _getsize(path, transport_params):
@@ -425,26 +490,40 @@ def _getsize(path, transport_params):
         return fin.tell()
 
 
-def search(key, file_path, index_path, output_stream, transport_params=None):
+def search(key, file_path, index_path, output_stream, buffer_size=_DEFAULT_BUFFER_SIZE,
+           transport_params=None):
     """Look up a single key in the index, and retrieve the corresponding line.
 
     :param bytes key: The key to search for.
     :param str file_path: A local or S3 path to the file retrieve data from.
     :param str index_path: A local or S3 path to the index file.
     :param str output_stream: The stream to output result to.
+    :param int buffer_size: The maximum size of the index file chunk to load in memory, in KiB.
     :param dict transport_params: Optional parameters for reading the files remotely.
     """
-    fsize = _getsize(index_path, transport_params=transport_params)
+    try:
+        fsize = _getsize(index_path, transport_params=transport_params)
+    except (FileNotFoundError, botocore.exceptions.BotoCoreError) as err:
+        _LOGGER.error("Can't open index file: %s", err)
+        sys.exit(1)
+
     with smart_open.open(index_path, 'rb', transport_params=transport_params) as fin:
-        chunk_offset, chunk_len, line_offset, line_len = _binary_search(key, fin, fsize)
+        chunk_offset, chunk_len, line_offset, line_len = _binary_search(
+            key, fin, fsize, buffer_size=buffer_size
+        )
 
     chunk_offset = int(chunk_offset)
     chunk_len = int(chunk_len)
     line_offset = int(line_offset)
     line_len = int(line_len)
 
-    with smart_open.open(file_path, 'rb',
-                         ignore_ext=True, transport_params=transport_params) as fin:
+    try:
+        fin = smart_open.open(file_path, 'rb', ignore_ext=True, transport_params=transport_params)
+    except (FileNotFoundError, botocore.exceptions.BotoCoreError) as err:
+        _LOGGER.error("Can't open data file: %s", err)
+        sys.exit(1)
+
+    with fin:
         fin.seek(chunk_offset)
         gzip_chunk = io.BytesIO(fin.read(chunk_len))
         with gzip.open(gzip_chunk, 'rb') as inner_fin:

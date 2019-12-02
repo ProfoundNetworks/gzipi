@@ -89,3 +89,39 @@ class BinarySearchTest(unittest.TestCase):
     def test_missing(self):
         with self.assertRaises(KeyError):
             gzipi.lib._binary_search(b'd', self.fin, self.fsize)
+
+    def test_exits_from_the_last_line_in_the_middle(self):
+        fin = io.BytesIO(
+            b"key1|0|100|300|500\n"
+            b"key2|0|100|400|1500\n"
+            b"key3|0|200|400|1500\n"
+            b"key4|0|300|500|22500\n"
+            b"key5|0|400|3600|33500n\n"
+        )
+        with self.assertRaises(KeyError):
+            gzipi.lib._binary_search(b'key33', fin, self.fsize)
+
+
+class BufferChunkTest(unittest.TestCase):
+    def setUp(self):
+        self.lines = (
+            b"key1|0|100|300|500\n",
+            b"key2|0|100|400|1500\n",
+            b"key3|0|200|400|1500\n",
+            b"key4|0|200|400|1500\n",
+        )
+
+    def test_buffers_chunk(self):
+        fin = io.BytesIO(b"".join(self.lines))
+        expected_scope = (0, 40, 3)
+
+        fin, start, end, pivot = gzipi.lib._buffer_chunk(fin, 25, 50, 22, b'\n')
+        self.assertEqual(fin.read(100), b"".join(self.lines[1:-1]))
+        self.assertEqual(expected_scope, (start, end, pivot))
+
+    def test_buffers_ideal_chunk(self):
+        fin = io.BytesIO(b"".join(self.lines))
+        expected_scope = (0, 20, 19)
+        fin, start, end, pivot = gzipi.lib._buffer_chunk(fin, 19, 39, 38, b'\n')
+        self.assertEqual(fin.read(100), self.lines[1])
+        self.assertEqual(expected_scope, (start, end, pivot))
