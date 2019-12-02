@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 ### Modified
 
 - Improve binary search by buffering small search scopes
+- Add transport_params keyword parameter for smart_open calls
 
 ### Fixed
 

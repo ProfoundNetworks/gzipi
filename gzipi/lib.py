@@ -60,14 +60,12 @@ import json
 import logging
 import multiprocessing
 import os
-import os.path as P
 import shutil
 import struct
 import sys
 import tempfile
 import time
 
-import boto3
 import botocore.exceptions
 import smart_open
 import plumbum
@@ -480,23 +478,18 @@ def _binary_search(key, fin, fsize, delimiter=b'|', lineterminator=b'\n',
             buffered = True
 
 
-def _getsize(path):
-    """Return the size of an object, in bytes.
+def _getsize(path, transport_params):
+    """Return the size of an file-like object, in bytes.
 
     Works for both S3 and local objects.
     """
-    if path.startswith('s3://'):
-        parsed_uri = smart_open.smart_open_lib._parse_uri(path)
-
-        session = boto3.Session()
-        s3 = session.resource('s3')
-        obj = s3.Object(parsed_uri.bucket_id, parsed_uri.key_id)
-        return obj.get()['ContentLength']
-    else:
-        return P.getsize(path)
+    with smart_open.open(path, 'rb', ignore_ext=True, transport_params=transport_params) as fin:
+        fin.seek(0, io.SEEK_END)
+        return fin.tell()
 
 
-def search(key, file_path, index_path, output_stream, buffer_size=_DEFAULT_BUFFER_SIZE):
+def search(key, file_path, index_path, output_stream, buffer_size=_DEFAULT_BUFFER_SIZE,
+           transport_params=None):
     """Look up a single key in the index, and retrieve the corresponding line.
 
     :param bytes key: The key to search for.
@@ -504,14 +497,15 @@ def search(key, file_path, index_path, output_stream, buffer_size=_DEFAULT_BUFFE
     :param str index_path: A local or S3 path to the index file.
     :param str output_stream: The stream to output result to.
     :param int buffer_size: The maximum size of the index file chunk to load in memory, in KiB.
+    :param dict transport_params: Optional parameters for reading the files remotely.
     """
     try:
-        fsize = _getsize(index_path)
+        fsize = _getsize(index_path, transport_params=transport_params)
     except (FileNotFoundError, botocore.exceptions.BotoCoreError) as err:
         _LOGGER.error("Can't open index file: %s", err)
         sys.exit(1)
 
-    with smart_open.open(index_path, 'rb') as fin:
+    with smart_open.open(index_path, 'rb', transport_params=transport_params) as fin:
         chunk_offset, chunk_len, line_offset, line_len = _binary_search(
             key, fin, fsize, buffer_size=buffer_size
         )
@@ -522,7 +516,7 @@ def search(key, file_path, index_path, output_stream, buffer_size=_DEFAULT_BUFFE
     line_len = int(line_len)
 
     try:
-        fin = smart_open.open(file_path, 'rb', ignore_ext=True)
+        fin = smart_open.open(file_path, 'rb', ignore_ext=True, transport_params=transport_params)
     except (FileNotFoundError, botocore.exceptions.BotoCoreError) as err:
         _LOGGER.error("Can't open data file: %s", err)
         sys.exit(1)
