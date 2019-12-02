@@ -132,11 +132,12 @@ class RepackEmptyTest(unittest.TestCase):
         self.fin = io.BytesIO()
         self.fout = io.BytesIO()
         self.index_fout = io.BytesIO()
+        self.gzip_header = gzip.compress(b'')
 
     def test_csv_contains_gzip_header(self):
         gzipi.lib.repack_csv_file(self.fin, self.fout, self.index_fout, 1000)
-        self.assertNotEqual(len(self.fout.getvalue()), 0)
+        self.assertEqual(self.fout.getvalue(), self.gzip_header)
 
     def test_json_contains_gzip_header(self):
         gzipi.lib.repack_json_file(self.fin, self.fout, self.index_fout, 1000)
-        self.assertNotEqual(len(self.fout.getvalue()), 0)
+        self.assertEqual(self.fout.getvalue(), self.gzip_header)
