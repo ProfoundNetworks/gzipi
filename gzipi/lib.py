@@ -60,14 +60,12 @@ import json
 import logging
 import multiprocessing
 import os
-import os.path as P
 import shutil
 import struct
 import sys
 import tempfile
 import time
 
-import boto3
 import botocore.exceptions
 import smart_open
 import plumbum
