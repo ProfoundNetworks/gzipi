@@ -541,6 +541,7 @@ def _extract_keys_from_csv(line, column, delimiter):
 
 def _repack(fin, fout, index_fout, chunk_size, extractor):
     start_offset, end_offset = 0, 0
+    gzipped_chunk = None
     with gzip.open(fin, 'rb') as fin:
         for batch in _batch_iterator(fin, decode_lines=False, batch_size=chunk_size):
             keys = []
@@ -568,6 +569,14 @@ def _repack(fin, fout, index_fout, chunk_size, extractor):
                 index += line_indexes[i]
                 index_fout.write(index.encode(_TEXT_ENCODING) + b'\n')
             index_fout.flush()
+
+    if gzipped_chunk is None:
+        #
+        # The input file contained no data.  We must write an empty gzip chunk
+        # to make sure the output file is gzip-readable.
+        #
+        fout.write(gzip.compress(b''))
+        fout.flush()
 
 
 def sort_file(file_path):

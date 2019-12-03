@@ -125,3 +125,19 @@ class BufferChunkTest(unittest.TestCase):
         fin, start, end, pivot = gzipi.lib._buffer_chunk(fin, 19, 39, 38, b'\n')
         self.assertEqual(fin.read(100), self.lines[1])
         self.assertEqual(expected_scope, (start, end, pivot))
+
+
+class RepackEmptyTest(unittest.TestCase):
+    def setUp(self):
+        self.fin = io.BytesIO()
+        self.fout = io.BytesIO()
+        self.index_fout = io.BytesIO()
+        self.gzip_header = gzip.compress(b'')
+
+    def test_csv_contains_gzip_header(self):
+        gzipi.lib.repack_csv_file(self.fin, self.fout, self.index_fout, 1000)
+        self.assertEqual(self.fout.getvalue(), self.gzip_header)
+
+    def test_json_contains_gzip_header(self):
+        gzipi.lib.repack_json_file(self.fin, self.fout, self.index_fout, 1000)
+        self.assertEqual(self.fout.getvalue(), self.gzip_header)
