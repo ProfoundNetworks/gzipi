@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 ### Fixed
 
 - Fix binary search does not terminate correctly on unknown keys
+- Fix repacking an empty file produces malformed gzip file
 
 # [0.1.1 ] - 2019-08-20
 
