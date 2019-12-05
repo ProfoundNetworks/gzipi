@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 
 ## Unreleased
 
+# [0.1.3] - 2019-12-05
+
+0.1.2 was a dud release.
+
 ### Modified
 
 - Improve binary search by buffering small search scopes
@@ -17,6 +21,6 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 - Fix binary search does not terminate correctly on unknown keys
 - Fix repacking an empty file produces malformed gzip file
 
-# [0.1.1 ] - 2019-08-20
+# [0.1.1] - 2019-08-20
 
 - First PyPI release.
