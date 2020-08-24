@@ -29,7 +29,7 @@ Repacking existing archives
 If your archive was not converted before, you need to repack it::
 
 
-    $ gzipi repack -f profiles.json.gz -i new_index.json.gz -o new_profiles.json.gz --format json --field domain
+    $ gzipi repack -f profiles.json.gz -i index.gzi -o repacked_profiles.json.gz --format json --field domain
 
 
 This command produces the repacked archive and the index file.
@@ -41,11 +41,11 @@ Retrieving data
 To quickly retrieve data, you need a repacked archive and the index file.
 
 
-Retrieving all data for specified domains from the stdin::
+Retrieving multiple keys provided via stdin::
 
-    $ cat domains_to_retrieve.txt | gzipi retrieve -f profiles.json.gz -i index.gzi--format json > data.json --field domain
+    $ cat domains_to_retrieve.txt | gzipi retrieve -f repacked_profiles.json.gz -i index.gzi --format json --field domain
 
-Retrieving a single record name::
+Retrieving a single key::
 
     $ gzipi search --input-file profiles.json.gz --index-file index.gzi --key google.com
 
