@@ -47,6 +47,27 @@ def test_repacks_csv_file():
     assert fout.getvalue().count(gzipi.lib._GZIP_HEADER) == 21
 
 
+def test_repacks_csv_zst_file():
+    curr_dir = P.dirname(P.abspath(__file__))
+    csv_file = open(P.join(curr_dir, 'data/sample.csv.zst'), 'rb')
+    fout = io.BytesIO()
+    index_fout = io.BytesIO()
+    gzipi.lib.repack_csv_file(
+        fin=csv_file,
+        fout=fout,
+        index_fout=index_fout,
+        chunk_size=50,
+        column=0,
+        delimiter=',',
+        output_compression=gzipi.lib.Compression.ZSTD.value,
+    )
+    expected_index = gzip.open(P.join(curr_dir, 'data/repacked_index_zst.csv.gz'), 'rb').read()
+    actual_index = index_fout.getvalue()
+    assert actual_index == expected_index
+    assert fout.getvalue().count(gzipi.lib._ZSTD_HEADER) == 21
+
+
 if __name__ == '__main__':
-    test_repacks_json_file()
-    test_repacks_csv_file()
+    # test_repacks_json_file()
+    # test_repacks_csv_file()
+    test_repacks_csv_zst_file()
