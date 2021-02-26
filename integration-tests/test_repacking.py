@@ -68,6 +68,6 @@ def test_repacks_csv_zst_file():
 
 
 if __name__ == '__main__':
-    # test_repacks_json_file()
-    # test_repacks_csv_file()
+    test_repacks_json_file()
+    test_repacks_csv_file()
     test_repacks_csv_zst_file()
