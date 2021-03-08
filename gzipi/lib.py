@@ -209,7 +209,7 @@ def _determine_compression_from_header(fin: IO[bytes]) -> Optional[str]:
 
 def _open_compressed_file(
     path: Union[str, IO],
-    compression: str,
+    compression: Optional[str],
     mode: str = 'r'
 ) -> IO:
     """Open the specified file for reading/writing.
