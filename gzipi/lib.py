@@ -70,14 +70,14 @@ import time
 from typing import (
     Any,
     Callable,
-    Dict,
-    Optional,
     cast,
+    Dict,
     IO,
-    List,
-    Union,
-    Tuple,
     Iterable,
+    List,
+    Optional,
+    Tuple,
+    Union,
 )
 
 import botocore.exceptions
@@ -168,6 +168,8 @@ _DEFAULT_BUFFER_SIZE = 1024
 
 _BYTES_IN_KiB = 1024
 
+_LINE_TERMINATOR = b'\n'
+
 
 class Compression(enum.Enum):
     NONE = None
@@ -178,7 +180,7 @@ class Compression(enum.Enum):
 SUPPORTED_COMPRESSIONS = {Compression.GZIP.value, Compression.ZSTD.value, }
 
 
-def get_compression_format(path: str) -> Optional[str]:
+def assume_compression_from_filename(path: str) -> Optional[str]:
     """Get compression format based on the extension."""
     if not isinstance(path, str):
         return Compression.NONE.value
@@ -192,10 +194,10 @@ def get_compression_format(path: str) -> Optional[str]:
 
 def _get_compression_type(path: str) -> Optional[str]:
     with open(path, 'rb') as fin:
-        return _get_compression_type_from_fin(fin)
+        return _determine_compression_from_header(fin)
 
 
-def _get_compression_type_from_fin(fin: IO) -> Optional[str]:
+def _determine_compression_from_header(fin: IO[bytes]) -> Optional[str]:
     header = fin.read(4)
     fin.seek(0)
     if header.startswith(_GZIP_HEADER):
@@ -205,23 +207,10 @@ def _get_compression_type_from_fin(fin: IO) -> Optional[str]:
     return Compression.NONE.value
 
 
-def _sniff_compression_type(path: str, mode: str) -> Optional[str]:
-    compression = get_compression_format(path)
-    if compression:
-        return compression
-    try:
-        compression = _get_compression_type(path) if 'r' in mode else Compression.NONE.value
-        if compression:
-            return compression
-    except Exception as err:
-        _LOGGER.error(err)
-    return compression
-
-
-def _open_file(
+def _open_compressed_file(
     path: Union[str, IO],
-    mode: str = 'r',
-    compression: Optional[str] = Compression.NONE.value,
+    compression: str,
+    mode: str = 'r'
 ) -> IO:
     """Open the specified file for reading/writing.
 
@@ -237,12 +226,12 @@ def _open_file(
         # zstandard does not support some operations for binary data (e.g. readline)
         # https://github.com/indygreg/python-zstandard/issues/136
         #
-        reader = zstandard.open(path, mode, encoding=encoding) # type: ignore
+        reader = zstandard.open(path, mode, encoding=encoding)  # type: ignore
         if 'b' in mode:
             reader = io.BufferedReader(reader) if 'r' in mode else io.BufferedWriter(reader)
         return cast(IO, reader)
     else:
-        raise ValueError("Unsupported compression: %r" % compression)
+        raise ValueError("Unsupported compression format: %r" % compression)
 
 
 def _is_valid_gzip_header(header: bytes) -> bool:
@@ -351,9 +340,9 @@ def index_csv_file(
     :param stream output_file: The binary file stream to write output to.
     :param int column: The index of the key column in the input file.
     :param str delimiter: The CSV delimiter to use.
-    :param int min_chunk_size: The minimum number of bytes in a single gzip/zstd chunk.
+    :param int min_chunk_size: The minimum number of bytes in a single chunk.
     """
-    compression = _get_compression_type_from_fin(csv_file)
+    compression = _determine_compression_from_header(csv_file)
     chunk_iterator = _iterate_archives(
         fin=csv_file,
         buffer_size=min_chunk_size,
@@ -362,7 +351,7 @@ def index_csv_file(
     for i, (arch, start_offset, end_offset) in enumerate(chunk_iterator):
         _LOGGER.info('processed %s chunk, offset: %s-%s' % (i, start_offset, end_offset))
         line_start, line_end = 0, 0
-        with _open_file(arch, mode='rb', compression=compression) as fin:
+        with _open_compressed_file(arch, compression, mode='rb') as fin:
             csv_in = _StreamWrapper(fin, decode_lines=True)
             csv_reader = csv.reader(csv_in, delimiter=delimiter)
             for row in csv_reader:
@@ -373,7 +362,7 @@ def index_csv_file(
                     end_offset - start_offset,
                     line_start, line_end - line_start,
                 )
-                output_file.write(index.encode(_TEXT_ENCODING) + b'\n')
+                output_file.write(index.encode(_TEXT_ENCODING) + _LINE_TERMINATOR)
 
 
 def index_json_file(
@@ -387,9 +376,9 @@ def index_json_file(
     :param json_file: The binary file stream to read input from.
     :param output_file: The binary file stream to write output to.
     :param field: The name of the key field in the JSON file.
-    :param min_chunk_size: The minimum number of bytes in a single gzip/zstd chunk.
+    :param min_chunk_size: The minimum number of bytes in a single chunk.
     """
-    compression = _get_compression_type_from_fin(json_file)
+    compression = _determine_compression_from_header(json_file)
     chunk_iterator = _iterate_archives(
         fin=json_file,
         buffer_size=min_chunk_size,
@@ -398,7 +387,7 @@ def index_json_file(
     for i, (arch, start_offset, end_offset) in enumerate(chunk_iterator):
         _LOGGER.info('processed %s chunk, offset: %s-%s' % (i, start_offset, end_offset))
         line_start, line_end = 0, 0
-        with _open_file(arch, mode='rb', compression=compression) as json_in:
+        with _open_compressed_file(arch, compression, mode='rb') as json_in:
             for line in json_in:
                 data = json.loads(line.decode(_TEXT_ENCODING))
                 line_start = line_end
@@ -408,7 +397,7 @@ def index_json_file(
                     start_offset, end_offset - start_offset,
                     line_start, line_end - line_start,
                 )
-                output_file.write(index.encode(_TEXT_ENCODING) + b'\n')
+                output_file.write(index.encode(_TEXT_ENCODING) + _LINE_TERMINATOR)
 
 
 def _batch_iterator(
@@ -478,7 +467,7 @@ def retrieve(
     :param index_fin: A file stream to read index from.
     :param output_stream: A file stream to output results to.
     """
-    compression = _sniff_compression_type(file_path, mode='rb')
+    compression = _get_compression_type(file_path)
     input_fin = smart_open.open(file_path, 'rb', ignore_ext=True)
     for keys in _batch_iterator(keys_fin, decode_lines=True):
         keys_idx = _scan_index(keys, index_fin)
@@ -489,7 +478,7 @@ def retrieve(
             input_fin.seek(start_offset)
 
             compressed_chunk = io.BytesIO(input_fin.read(offset_length))
-            with _open_file(compressed_chunk, mode='rb', compression=compression) as fin:
+            with _open_compressed_file(compressed_chunk, compression, mode='rb') as fin:
                 for row in group:
                     fin.seek(int(row[3]))
                     domain = row[0]
@@ -502,7 +491,7 @@ def retrieve(
 
 def _start_of_line(
     fin: IO[bytes],
-    lineterminator: bytes = b'\n',
+    lineterminator: bytes = _LINE_TERMINATOR,
     bufsize: int = io.DEFAULT_BUFFER_SIZE
 ) -> None:
     """Moves the file pointer back to the start of the current line."""
@@ -532,7 +521,11 @@ def _start_of_line(
 
 
 def _buffer_chunk(
-    fin: IO[bytes], start: int, end: int, pivot: int, lineterminator: bytes
+    fin: IO[bytes],
+    start: int,
+    end: int,
+    pivot: int,
+    lineterminator: bytes,
 ) -> Tuple[IO[bytes], int, int, int]:
     #
     # This function reads a specified chunk into memory to avoid hitting disk or network
@@ -569,7 +562,7 @@ def _is_last_line(fin: IO[bytes], start: int, end: int) -> bool:
     #
     # It's possible to be in the middle of two last lines.
     #
-    if data.count(b'\n') == 0:
+    if data.count(_LINE_TERMINATOR) == 0:
         return True
     else:
         fin.seek(current_pos)
@@ -580,8 +573,8 @@ def _binary_search(
     key: bytes,
     fin: IO[bytes],
     fsize: int,
-    delimiter: bytes = b'|',
-    lineterminator: bytes = b'\n',
+    delimiter: bytes = DEFAULT_CSV_DELIMITER.encode(_TEXT_ENCODING),
+    lineterminator: bytes = _LINE_TERMINATOR,
     buffer_size: int = _DEFAULT_BUFFER_SIZE
 ) -> Optional[List[bytes]]:
     seen = set()
@@ -686,8 +679,8 @@ def search(
     with fin:
         fin.seek(chunk_offset)
         chunk = io.BytesIO(fin.read(chunk_len))
-        compression = _sniff_compression_type(file_path, mode='rb')
-        with _open_file(chunk, mode='rb', compression=compression) as inner_fin:
+        compression = _get_compression_type(file_path)
+        with _open_compressed_file(chunk, compression, mode='rb') as inner_fin:
             inner_fin.seek(line_offset)
             output_stream.write(inner_fin.read(line_len))
 
@@ -712,16 +705,16 @@ def _repack(
 ) -> None:
     start_offset, end_offset = 0, 0
     compressed_chunk = None
-    compression = _get_compression_type_from_fin(fin)
+    compression = _determine_compression_from_header(fin)
     assert compression in SUPPORTED_COMPRESSIONS
     assert output_compression in SUPPORTED_COMPRESSIONS
 
-    with _open_file(fin, mode='rb', compression=compression) as fin:
+    with _open_compressed_file(fin, compression, mode='rb') as fin:
         for batch in _batch_iterator(fin, decode_lines=False, batch_size=chunk_size):
             keys = []
             line_indexes = []
             chunk = io.BytesIO()
-            compressed_chunk = _open_file(chunk, mode='wb', compression=output_compression)
+            compressed_chunk = _open_compressed_file(chunk, output_compression, mode='wb')
 
             line_start, line_end = 0, 0
             for line in batch:
@@ -741,7 +734,7 @@ def _repack(
             for i, key in enumerate(keys):
                 index = '%s|%s|%s' % (key, start_offset, end_offset - start_offset)
                 index += line_indexes[i]
-                index_fout.write(index.encode(_TEXT_ENCODING) + b'\n')
+                index_fout.write(index.encode(_TEXT_ENCODING) + _LINE_TERMINATOR)
             index_fout.flush()
 
     if compressed_chunk is None:

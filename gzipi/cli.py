@@ -35,7 +35,7 @@ Available commands:
     gzipi search    Use a previously created index to quickly access a single
                     line in the compressed file.  Performs a binary search on
                     the index, which must be sorted on the key.
-    gzipi repack    Recompress a gzip or zstd file and create a new index for it.
+    gzipi repack    Recompress a compressed file and create a new index for it.
 """
 
 
@@ -52,7 +52,7 @@ def _index_subparser(subparsers):
     )
     parser.add_argument(
         '-o', '--index-file', required=False,
-        help="The path to save compressed output to."
+        help="The path to save output to."
     )
     parser.add_argument('--format', required=True, choices=lib.FILE_FORMATS,
                         help='The format of the input file.')
@@ -120,7 +120,7 @@ def _retrieve_subparser(subparsers):
                         help='The local path to read index data from.')
     parser.add_argument(
         '-o', '--output-file', required=False,
-        help='The path to save compressed output to. By default, outputs to stdout.'
+        help='The path to save output to. By default, outputs to stdout.'
     )
     parser.set_defaults(function=_retrieve)
 
@@ -166,7 +166,7 @@ def _search_subparser(subparsers):
                         help='The local path to read index data from.')
     parser.add_argument(
         '-o', '--output-file', required=False,
-        help='The path to save compressed output to. By default, outputs to stdout.'
+        help='The path to save output to. By default, outputs to stdout.'
     )
     parser.set_defaults(function=_search)
 
@@ -199,7 +199,7 @@ def _exists(path):
 
 
 def _repack_subparser(subparsers):
-    desc = 'Repack a compressed gzip or zstd file into a chunked gzipped file and an index file.'
+    desc = 'Repack a compressed file into chunks supported by an index file.'
     parser = subparsers.add_parser('repack', description=desc, help=desc)
     parser.add_argument(
         '-f', '--input-file', required=False,
@@ -218,7 +218,7 @@ def _repack_subparser(subparsers):
     parser.add_argument('--field', required=False, default=lib.DEFAULT_JSON_FIELD,
                         help='The name of key field to use for JSON format.')
     parser.add_argument('--chunk-size', required=False, default=lib.DEFAULT_CHUNK_SIZE,
-                        help='The number of lines to pack in a single gzip/zstd chunk.')
+                        help='The number of lines to pack into a single chunk.')
     parser.set_defaults(function=_repack)
 
 
@@ -263,7 +263,7 @@ def _repack(args):
 
     index_fout = smart_open.open(args.index_file, 'wb')
 
-    output_compression = lib.get_compression_format(args.output_file)
+    output_compression = lib.assume_compression_from_filename(args.output_file)
     assert output_compression in lib.SUPPORTED_COMPRESSIONS
 
     if args.output_file:
