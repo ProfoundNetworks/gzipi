@@ -192,11 +192,6 @@ def assume_compression_from_filename(path: str) -> Optional[str]:
         return Compression.NONE.value
 
 
-def _get_compression_type(path: str) -> Optional[str]:
-    with open(path, 'rb') as fin:
-        return _determine_compression_from_header(fin)
-
-
 def _determine_compression_from_header(fin: IO[bytes]) -> Optional[str]:
     header = fin.read(4)
     fin.seek(0)
@@ -467,8 +462,8 @@ def retrieve(
     :param index_fin: A file stream to read index from.
     :param output_stream: A file stream to output results to.
     """
-    compression = _get_compression_type(file_path)
     input_fin = smart_open.open(file_path, 'rb', ignore_ext=True)
+    compression = _determine_compression_from_header(input_fin)
     for keys in _batch_iterator(keys_fin, decode_lines=True):
         keys_idx = _scan_index(keys, index_fin)
         displayed = set()
@@ -679,7 +674,7 @@ def search(
     with fin:
         fin.seek(chunk_offset)
         chunk = io.BytesIO(fin.read(chunk_len))
-        compression = _get_compression_type(file_path)
+        compression = _determine_compression_from_header(fin)
         with _open_compressed_file(chunk, compression, mode='rb') as inner_fin:
             inner_fin.seek(line_offset)
             output_stream.write(inner_fin.read(line_len))
