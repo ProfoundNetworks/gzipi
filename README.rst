@@ -2,7 +2,7 @@
 gzipi
 =====
 
-Tools for indexing gzip files to support random-like access.
+Tools for indexing compressed files (currently supporting gzip and zstandard) to support random-like access.
 
 Installing
 ~~~~~~~~~~

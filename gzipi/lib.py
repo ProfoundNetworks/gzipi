@@ -2,15 +2,15 @@
 # -*- coding: utf-8 -*-
 # (C) Copyright: Profound Networks, LLC 2019
 #
-"""Implements gzip indexing, repacking and searching.
+"""Implements gzip and Zstandard indexing, repacking and searching.
 
 Background
 ----------
 
-Ordinary gzip files are not searchable.  You have to read the file from the
+Ordinary gzip and Zstandard files are not searchable.  You have to read the file from the
 beginning until you find the required record.
 
-``gzipi`` works on gzipped CSV and JSON files, expecting the files to contain a
+``gzipi`` works on compressed CSV and JSON files, expecting the files to contain a
 single *record* per line.  Each record consists of multiple columns, in the
 case of CSV, or fields, in the case of JSON.  ``gzipi`` picks one of these
 columns/fields as the **index key**.
@@ -18,7 +18,7 @@ columns/fields as the **index key**.
 Using ``gzipi``
 ---------------
 
-Before you can use ``gzipi`` to search your gzipped CSV or JSON files, you must
+Before you can use ``gzipi`` to search your compressed CSV or JSON files, you must
 **repack** them.  Repacking break ordinary gzip files into multiple chunks,
 where each chunk is like an ordinary gzip file.  While doing this, ``gzipi``
 builds an index, keeping track of chunks and keys.  More specifically, for each
@@ -37,12 +37,12 @@ The index is therefore CSV in the following format::
 
 Finally, ``gzipi`` concatenates all the chunks to create the repacked file.
 This repacked file is fully compatible with the ``gzip`` family of tools, and
-behaves like the original gzipped CSV or JSON file.
+behaves like the original compressed CSV or JSON file.
 
 The main entry points of this module are:
 
 - index_csv_file, index_json_file: Scan a file and create a new index file.
-- repack_json_file, repack_csv_file: Recompress a gzip file and create a new
+- repack_json_file, repack_csv_file: Recompress a compressed file and create a new
   index for it.
 - search: Look up a single key in the index.
 - retrieve: Use a previously created index to quickly access individual lines
@@ -53,6 +53,7 @@ The main entry points of this module are:
 import collections
 import csv
 import distutils.spawn
+import enum
 import functools
 import gzip
 import io
@@ -66,9 +67,23 @@ import sys
 import tempfile
 import time
 
+from typing import (
+    Any,
+    Callable,
+    cast,
+    Dict,
+    IO,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
+
 import botocore.exceptions
-import smart_open
 import plumbum
+import smart_open
+import zstandard
 
 _GZIP_HEADER = b'\x1f\x8b\x08'
 """A magic gzip header and two compression flags.
@@ -91,9 +106,17 @@ Offset   Length   Contents
                      bit 5 set: file is encrypted, encryption header present
                      bit 6,7:   reserved
 """
+_ZSTD_HEADER = b'(\xb5/\xfd'
+
 _GZIP_HEADER_LENGTH = 10
 """The length of main fields of gzip header, in bytes."""
-_WINDOW_OFFSET = (_GZIP_HEADER_LENGTH - 1) * -1
+_ZSTD_HEADER_LENGTH = 18
+"""The maximum header length of the Zstandard header.
+
+https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#frame_header
+"""
+_WINDOW_OFFSET_GZIP = (_GZIP_HEADER_LENGTH - 1) * -1
+_WINDOW_OFFSET_ZST = (_ZSTD_HEADER_LENGTH - 1) * -1
 _MIN_CHUNK_SIZE = 100000
 """The minimum amount of bytes in each chunk.
 
@@ -145,17 +168,77 @@ _DEFAULT_BUFFER_SIZE = 1024
 
 _BYTES_IN_KiB = 1024
 
+_LINE_TERMINATOR = b'\n'
 
-def _is_valid_gzip_header(gzip_header):
+
+class Compression(enum.Enum):
+    NONE = None
+    GZIP = 'gzip'
+    ZSTD = 'zstd'
+
+
+SUPPORTED_COMPRESSIONS = {Compression.GZIP.value, Compression.ZSTD.value, }
+
+
+def assume_compression_from_filename(path: str) -> Optional[str]:
+    """Get compression format based on the extension."""
+    if not isinstance(path, str):
+        return Compression.NONE.value
+    if path.endswith('.gz'):
+        return Compression.GZIP.value
+    elif path.endswith('.zst'):
+        return Compression.ZSTD.value
+    else:
+        return Compression.NONE.value
+
+
+def _determine_compression_from_header(fin: IO[bytes]) -> Optional[str]:
+    header = fin.read(4)
+    fin.seek(0)
+    if header.startswith(_GZIP_HEADER):
+        return Compression.GZIP.value
+    elif header.startswith(_ZSTD_HEADER):
+        return Compression.ZSTD.value
+    return Compression.NONE.value
+
+
+def _open_compressed_file(
+    path: Union[str, IO],
+    compression: Optional[str],
+    mode: str = 'r'
+) -> IO:
+    """Open the specified file for reading/writing.
+
+    Transparently opens compressed (``.gz``, ``.zst``) files.
+    """
+    if 'b' not in mode and 't' not in mode:
+        mode += 't'
+    encoding = None if 'b' in mode else _TEXT_ENCODING
+    if compression == Compression.GZIP.value:
+        return cast(IO, gzip.open(path, mode, encoding=encoding))
+    elif compression == Compression.ZSTD.value:
+        #
+        # zstandard does not support some operations for binary data (e.g. readline)
+        # https://github.com/indygreg/python-zstandard/issues/136
+        #
+        reader = zstandard.open(path, mode, encoding=encoding)  # type: ignore
+        if 'b' in mode:
+            reader = io.BufferedReader(reader) if 'r' in mode else io.BufferedWriter(reader)
+        return cast(IO, reader)
+    else:
+        raise ValueError("Unsupported compression format: %r" % compression)
+
+
+def _is_valid_gzip_header(header: bytes) -> bool:
     #
     # Extra sanity checks to ensure that we are working with the actual gzip header.
     # There is a chance that compressed data may look like the start of gzip header.
     #
-    if len(gzip_header) < _GZIP_HEADER_LENGTH:
+    if len(header) < _GZIP_HEADER_LENGTH:
         return False
 
     try:
-        unix_timestamp = struct.unpack("i", gzip_header[4:8])[0]
+        unix_timestamp = struct.unpack("i", header[4:8])[0]
     except Exception as err:
         _LOGGER.debug("Can't parse GZIP header: %s", err)
         return False
@@ -163,23 +246,45 @@ def _is_valid_gzip_header(gzip_header):
     if unix_timestamp < _OLDEST_UNIX_TIMESTAMP or unix_timestamp > time.time():
         return False
 
-    if gzip_header[9] not in _POSSIBLE_OS_TYPES:
+    if header[9] not in _POSSIBLE_OS_TYPES:
         return False
 
-    flags = gzip_header[4]
+    flags = header[4]
     if flags > 0xfc:
         return True
 
     return True
 
 
-def _iterate_archives(fin, buffer_size=_MIN_CHUNK_SIZE):
+def _is_valid_zstd_header(header: bytes) -> bool:
+    flags = header[4:5]
+    binary_string = "{:08b}".format(int(flags.hex(), 16))
+    if not binary_string[3:5] == '00':
+        return False
+    if not binary_string[5] == '1':
+        return False
+    return True
+
+
+def _iterate_archives(
+    fin: IO[bytes],
+    buffer_size: int = _MIN_CHUNK_SIZE,
+    compression: Optional[str] = Compression.GZIP.value
+) -> Iterable[Tuple[IO[bytes], int, int]]:
     #
     # We could use ByteIO container here, but byte strings work faster and easier
     # to work with for our particular case.
     #
     archive = b""
     start_offset, end_offset = 0, 0
+
+    assert compression in SUPPORTED_COMPRESSIONS
+    if compression == Compression.GZIP.value:
+        w_offset, header, header_length = _WINDOW_OFFSET_GZIP, _GZIP_HEADER, _GZIP_HEADER_LENGTH
+        valid_header = _is_valid_gzip_header
+    else:
+        w_offset, header, header_length = _WINDOW_OFFSET_ZST, _ZSTD_HEADER, _ZSTD_HEADER_LENGTH
+        valid_header = _is_valid_zstd_header
 
     while True:
         chunk = fin.read(buffer_size)
@@ -192,20 +297,20 @@ def _iterate_archives(fin, buffer_size=_MIN_CHUNK_SIZE):
             return
 
         #
-        # Include data from the previous chunk to be sure that gzip header won't be splitted
+        # Include data from the previous chunk to be sure that gzip/zstd header won't be splitted
         # across multiple chunks.
         #
-        window = archive[_WINDOW_OFFSET:] + chunk
+        window = archive[w_offset:] + chunk
         archive += chunk
-        if len(window) < _GZIP_HEADER_LENGTH or window.rfind(_GZIP_HEADER) == -1:
+        if len(window) < header_length or window.rfind(header) == -1:
             continue
 
-        header_pos = archive.rfind(_GZIP_HEADER)
+        header_pos = archive.rfind(header)
         if any([
             header_pos <= 0,
-            len(archive) < _GZIP_HEADER_LENGTH,
-            len(archive) - header_pos < _GZIP_HEADER_LENGTH,
-            not _is_valid_gzip_header(archive[header_pos:header_pos + _GZIP_HEADER_LENGTH])
+            len(archive) < header_length,
+            len(archive) - header_pos < header_length,
+            not valid_header(archive[header_pos:header_pos + header_length])
         ]):
             continue
 
@@ -218,22 +323,30 @@ def _iterate_archives(fin, buffer_size=_MIN_CHUNK_SIZE):
 
 
 def index_csv_file(
-    csv_file, output_file, column=DEFAULT_CSV_COLUMN,
-    delimiter=DEFAULT_CSV_DELIMITER, min_chunk_size=_MIN_CHUNK_SIZE
-):
-    """Index a gzipped CSV file from the file stream.
+    csv_file: IO[bytes],
+    output_file: IO[bytes],
+    column: int = DEFAULT_CSV_COLUMN,
+    delimiter: str = DEFAULT_CSV_DELIMITER,
+    min_chunk_size: int = _MIN_CHUNK_SIZE
+) -> None:
+    """Index a compressed CSV file from the file stream.
 
     :param stream csv_file: The binary file stream to read input from.
     :param stream output_file: The binary file stream to write output to.
     :param int column: The index of the key column in the input file.
     :param str delimiter: The CSV delimiter to use.
-    :param int min_chunk_size: The minimum number of bytes in a single gzip chunk.
+    :param int min_chunk_size: The minimum number of bytes in a single chunk.
     """
-    chunk_iterator = _iterate_archives(csv_file, buffer_size=min_chunk_size)
+    compression = _determine_compression_from_header(csv_file)
+    chunk_iterator = _iterate_archives(
+        fin=csv_file,
+        buffer_size=min_chunk_size,
+        compression=compression
+    )
     for i, (arch, start_offset, end_offset) in enumerate(chunk_iterator):
         _LOGGER.info('processed %s chunk, offset: %s-%s' % (i, start_offset, end_offset))
         line_start, line_end = 0, 0
-        with gzip.open(arch, mode='rb') as fin:
+        with _open_compressed_file(arch, compression, mode='rb') as fin:
             csv_in = _StreamWrapper(fin, decode_lines=True)
             csv_reader = csv.reader(csv_in, delimiter=delimiter)
             for row in csv_reader:
@@ -244,23 +357,32 @@ def index_csv_file(
                     end_offset - start_offset,
                     line_start, line_end - line_start,
                 )
-                output_file.write(index.encode(_TEXT_ENCODING) + b'\n')
+                output_file.write(index.encode(_TEXT_ENCODING) + _LINE_TERMINATOR)
 
 
-def index_json_file(json_file, output_file, field=DEFAULT_JSON_FIELD,
-                    min_chunk_size=_MIN_CHUNK_SIZE):
-    """Index a gzipped JSON file from the file stream.
+def index_json_file(
+    json_file: IO[bytes],
+    output_file: IO[bytes],
+    field: str = DEFAULT_JSON_FIELD,
+    min_chunk_size: int = _MIN_CHUNK_SIZE
+) -> None:
+    """Index a compressed JSON file from the file stream.
 
-    :param stream json_file: The binary file stream to read input from.
-    :param stream output_file: The binary file stream to write output to.
-    :param str field: The name of the key field in the JSON file.
-    :param int min_chunk_size: The minimum number of bytes in a single gzip chunk.
+    :param json_file: The binary file stream to read input from.
+    :param output_file: The binary file stream to write output to.
+    :param field: The name of the key field in the JSON file.
+    :param min_chunk_size: The minimum number of bytes in a single chunk.
     """
-    chunk_iterator = _iterate_archives(json_file, buffer_size=min_chunk_size)
+    compression = _determine_compression_from_header(json_file)
+    chunk_iterator = _iterate_archives(
+        fin=json_file,
+        buffer_size=min_chunk_size,
+        compression=compression,
+    )
     for i, (arch, start_offset, end_offset) in enumerate(chunk_iterator):
         _LOGGER.info('processed %s chunk, offset: %s-%s' % (i, start_offset, end_offset))
         line_start, line_end = 0, 0
-        with gzip.open(arch, mode='rb') as json_in:
+        with _open_compressed_file(arch, compression, mode='rb') as json_in:
             for line in json_in:
                 data = json.loads(line.decode(_TEXT_ENCODING))
                 line_start = line_end
@@ -270,10 +392,14 @@ def index_json_file(json_file, output_file, field=DEFAULT_JSON_FIELD,
                     start_offset, end_offset - start_offset,
                     line_start, line_end - line_start,
                 )
-                output_file.write(index.encode(_TEXT_ENCODING) + b'\n')
+                output_file.write(index.encode(_TEXT_ENCODING) + _LINE_TERMINATOR)
 
 
-def _batch_iterator(iterator, decode_lines=False, batch_size=_MAX_RECORDS_PER_BATCH):
+def _batch_iterator(
+    iterator: Iterable,
+    decode_lines: bool = False,
+    batch_size: int = _MAX_RECORDS_PER_BATCH
+) -> Iterable[List[Any]]:
     items = []
     for item in iterator:
         if decode_lines:
@@ -287,9 +413,9 @@ def _batch_iterator(iterator, decode_lines=False, batch_size=_MAX_RECORDS_PER_BA
         yield items
 
 
-def _scan_index(keys, index_fin):
+def _scan_index(keys: Iterable, index_fin: IO[str]) -> Dict[int, list]:
     #
-    # Groups indexes by gzip chunks and filters them.
+    # Groups indexes by gzip/zstd chunks and filters them.
     #
     keys_idx = collections.defaultdict(list)
     keys = set(keys)
@@ -326,16 +452,18 @@ class _StreamWrapper:
             return self.current_line
 
 
-def retrieve(keys_fin, file_path, index_fin, output_stream):
+def retrieve(
+    keys_fin: IO[bytes], file_path: str, index_fin: IO[str], output_stream: IO[bytes]
+) -> None:
     """Retrieve data from an indexed file.
 
-    :param file keys_fin: A steam with list of keys to retrieve.
-    :param str file_path: A local S3 path to the file retrieve data from.
-    :param str index_fin: A file stream to read index from.
-    :param file output_stream: A file stream to output results to.
+    :param keys_fin: A steam with list of keys to retrieve.
+    :param file_path: A local S3 path to the file retrieve data from.
+    :param index_fin: A file stream to read index from.
+    :param output_stream: A file stream to output results to.
     """
-
     input_fin = smart_open.open(file_path, 'rb', ignore_ext=True)
+    compression = _determine_compression_from_header(input_fin)
     for keys in _batch_iterator(keys_fin, decode_lines=True):
         keys_idx = _scan_index(keys, index_fin)
         displayed = set()
@@ -344,19 +472,23 @@ def retrieve(keys_fin, file_path, index_fin, output_stream):
             start_offset, offset_length = int(index[1]), int(index[2])
             input_fin.seek(start_offset)
 
-            gzip_chunk = io.BytesIO(input_fin.read(offset_length))
-            with gzip.open(gzip_chunk, 'rb') as gzip_fin:
+            compressed_chunk = io.BytesIO(input_fin.read(offset_length))
+            with _open_compressed_file(compressed_chunk, compression, mode='rb') as fin:
                 for row in group:
-                    gzip_fin.seek(int(row[3]))
+                    fin.seek(int(row[3]))
                     domain = row[0]
-                    line = gzip_fin.read(int(row[4]))
+                    line = fin.read(int(row[4]))
                     output_stream.write(line)
                     if domain in displayed:
                         _LOGGER.error("multiple matches for %s key")
                     displayed.add(domain)
 
 
-def _start_of_line(fin, lineterminator=b'\n', bufsize=io.DEFAULT_BUFFER_SIZE):
+def _start_of_line(
+    fin: IO[bytes],
+    lineterminator: bytes = _LINE_TERMINATOR,
+    bufsize: int = io.DEFAULT_BUFFER_SIZE
+) -> None:
     """Moves the file pointer back to the start of the current line."""
     while True:
         current_pos = fin.tell()
@@ -383,7 +515,13 @@ def _start_of_line(fin, lineterminator=b'\n', bufsize=io.DEFAULT_BUFFER_SIZE):
             break
 
 
-def _buffer_chunk(fin, start, end, pivot, lineterminator):
+def _buffer_chunk(
+    fin: IO[bytes],
+    start: int,
+    end: int,
+    pivot: int,
+    lineterminator: bytes,
+) -> Tuple[IO[bytes], int, int, int]:
     #
     # This function reads a specified chunk into memory to avoid hitting disk or network
     # storage on every seek/read call. We use it when the search scope is relatively small.
@@ -412,22 +550,28 @@ def _buffer_chunk(fin, start, end, pivot, lineterminator):
     return buf, start, end, pivot
 
 
-def _is_last_line(fin, start, end):
+def _is_last_line(fin: IO[bytes], start: int, end: int) -> bool:
     current_pos = fin.tell()
     fin.seek(start)
     data = fin.read(end - start)
     #
     # It's possible to be in the middle of two last lines.
     #
-    if data.count(b'\n') == 0:
+    if data.count(_LINE_TERMINATOR) == 0:
         return True
     else:
         fin.seek(current_pos)
         return False
 
 
-def _binary_search(key, fin, fsize, delimiter=b'|', lineterminator=b'\n',
-                   buffer_size=_DEFAULT_BUFFER_SIZE):
+def _binary_search(
+    key: bytes,
+    fin: IO[bytes],
+    fsize: int,
+    delimiter: bytes = DEFAULT_CSV_DELIMITER.encode(_TEXT_ENCODING),
+    lineterminator: bytes = _LINE_TERMINATOR,
+    buffer_size: int = _DEFAULT_BUFFER_SIZE
+) -> Optional[List[bytes]]:
     seen = set()
     start, pivot, end = 0, fsize // 2, fsize
     buffered = False
@@ -478,7 +622,7 @@ def _binary_search(key, fin, fsize, delimiter=b'|', lineterminator=b'\n',
             buffered = True
 
 
-def _getsize(path, transport_params):
+def _getsize(path: str, transport_params: Optional[dict]) -> int:
     """Return the size of an file-like object, in bytes.
 
     Works for both S3 and local objects.
@@ -488,19 +632,25 @@ def _getsize(path, transport_params):
         return fin.tell()
 
 
-def search(key, file_path, index_path, output_stream, buffer_size=_DEFAULT_BUFFER_SIZE,
-           transport_params=None):
+def search(
+    key: bytes,
+    file_path: str,
+    index_path: str,
+    output_stream: IO[bytes],
+    buffer_size: int = _DEFAULT_BUFFER_SIZE,
+    transport_params: Optional[dict] = None
+) -> None:
     """Look up a single key in the index, and retrieve the corresponding line.
 
-    :param bytes key: The key to search for.
-    :param str file_path: A local or S3 path to the file retrieve data from.
-    :param str index_path: A local or S3 path to the index file.
-    :param str output_stream: The stream to output result to.
-    :param int buffer_size: The maximum size of the index file chunk to load in memory, in KiB.
-    :param dict transport_params: Optional parameters for reading the files remotely.
+    :param key: The key to search for.
+    :param file_path: A local or S3 path to the file retrieve data from.
+    :param index_path: A local or S3 path to the index file.
+    :param output_stream: The stream to output result to.
+    :param buffer_size: The maximum size of the index file chunk to load in memory, in KiB.
+    :param transport_params: Optional parameters for reading the files remotely.
     """
     try:
-        fsize = _getsize(index_path, transport_params=transport_params)
+        fsize = _getsize(index_path, transport_params=transport_params) # type: ignore
     except (FileNotFoundError, botocore.exceptions.BotoCoreError) as err:
         _LOGGER.error("Can't open index file: %s", err)
         sys.exit(1)
@@ -508,7 +658,7 @@ def search(key, file_path, index_path, output_stream, buffer_size=_DEFAULT_BUFFE
     with smart_open.open(index_path, 'rb', transport_params=transport_params) as fin:
         chunk_offset, chunk_len, line_offset, line_len = _binary_search(
             key, fin, fsize, buffer_size=buffer_size
-        )
+        )  # type: ignore
 
     chunk_offset = int(chunk_offset)
     chunk_len = int(chunk_len)
@@ -523,31 +673,43 @@ def search(key, file_path, index_path, output_stream, buffer_size=_DEFAULT_BUFFE
 
     with fin:
         fin.seek(chunk_offset)
-        gzip_chunk = io.BytesIO(fin.read(chunk_len))
-        with gzip.open(gzip_chunk, 'rb') as inner_fin:
+        chunk = io.BytesIO(fin.read(chunk_len))
+        compression = _determine_compression_from_header(fin)
+        with _open_compressed_file(chunk, compression, mode='rb') as inner_fin:
             inner_fin.seek(line_offset)
             output_stream.write(inner_fin.read(line_len))
 
 
-def _extract_keys_from_json(line, field):
+def _extract_keys_from_json(line: bytes, field: str) -> str:
     data = json.loads(line.decode(_TEXT_ENCODING))
     return data[field]
 
 
-def _extract_keys_from_csv(line, column, delimiter):
+def _extract_keys_from_csv(line: bytes, column: str, delimiter: str) -> str:
     reader = csv.reader(io.StringIO(line.decode(_TEXT_ENCODING)), delimiter=delimiter)
-    return next(reader)[column]
+    return next(reader)[column]  # type: ignore
 
 
-def _repack(fin, fout, index_fout, chunk_size, extractor):
+def _repack(
+    fin: IO[bytes],
+    fout: IO[bytes],
+    index_fout: IO[bytes],
+    chunk_size: int,
+    extractor: Callable,
+    output_compression: str = Compression.GZIP.value,
+) -> None:
     start_offset, end_offset = 0, 0
-    gzipped_chunk = None
-    with gzip.open(fin, 'rb') as fin:
+    compressed_chunk = None
+    compression = _determine_compression_from_header(fin)
+    assert compression in SUPPORTED_COMPRESSIONS
+    assert output_compression in SUPPORTED_COMPRESSIONS
+
+    with _open_compressed_file(fin, compression, mode='rb') as fin:
         for batch in _batch_iterator(fin, decode_lines=False, batch_size=chunk_size):
             keys = []
             line_indexes = []
             chunk = io.BytesIO()
-            gzipped_chunk = gzip.GzipFile(fileobj=chunk, mode='wb')
+            compressed_chunk = _open_compressed_file(chunk, output_compression, mode='wb')
 
             line_start, line_end = 0, 0
             for line in batch:
@@ -556,9 +718,9 @@ def _repack(fin, fout, index_fout, chunk_size, extractor):
                 line_start = line_end
                 line_end = line_start + len(line)
                 line_indexes.append('|%s|%s' % (line_start, line_end - line_start))
-                gzipped_chunk.write(line)
+                compressed_chunk.write(line)
 
-            gzipped_chunk.close()
+            compressed_chunk.close()
             fout.write(chunk.getvalue())
             fout.flush()
 
@@ -567,22 +729,24 @@ def _repack(fin, fout, index_fout, chunk_size, extractor):
             for i, key in enumerate(keys):
                 index = '%s|%s|%s' % (key, start_offset, end_offset - start_offset)
                 index += line_indexes[i]
-                index_fout.write(index.encode(_TEXT_ENCODING) + b'\n')
+                index_fout.write(index.encode(_TEXT_ENCODING) + _LINE_TERMINATOR)
             index_fout.flush()
 
-    if gzipped_chunk is None:
+    if compressed_chunk is None:
         #
         # The input file contained no data.  We must write an empty gzip chunk
         # to make sure the output file is gzip-readable.
         #
-        fout.write(gzip.compress(b''))
+        fout = io.BytesIO()
+        zstandard.open(fout, mode='wb').write(b'').close()
+        fout.write(fout.getvalue())
         fout.flush()
 
 
-def sort_file(file_path):
+def sort_file(file_path: str) -> None:
     """Sort a file using GNU toolchain.
 
-    :param str file_path: The path to file to sort.
+    :param file_path: The path to file to sort.
     """
     sorted_handle, tmp_path = tempfile.mkstemp(prefix='gzipi')
     os.close(sorted_handle)
@@ -615,35 +779,51 @@ def sort_file(file_path):
             os.remove(tmp_path)
 
 
-def repack_json_file(fin, fout, index_fout, chunk_size, field=DEFAULT_JSON_FIELD):
+def repack_json_file(
+    fin: IO[bytes],
+    fout: IO[bytes],
+    index_fout: IO[bytes],
+    chunk_size: int,
+    field: str = DEFAULT_JSON_FIELD,
+    output_compression: str = Compression.GZIP.value,
+) -> None:
     """Repack a JSON file.
 
-    :param file fin: A gzip-compressed binary file stream to read from.  Must contain JSON.
-    :param file fout: A gzip-compressed binary file stream to write to.
-    :param file index_fout: A **text** file stream to write the index to.
-    :param int chunk_size: The number of lines to include in each chunk.
-    :param str field: The field to use when creating the index.
+    :param fin: A compressed binary file stream to read from.  Must contain JSON.
+    :param fout: A compressed binary file stream to write to.
+    :param index_fout: A **text** file stream to write the index to.
+    :param chunk_size: The number of lines to include in each chunk.
+    :param field: The field to use when creating the index.
+    :param output_compression: The compression format of the output file. Supports gzip and zstd.
     """
     extractor = functools.partial(_extract_keys_from_json, field=field)
-    return _repack(fin, fout, index_fout, chunk_size, extractor)
+    return _repack(fin, fout, index_fout, chunk_size, extractor, output_compression)
 
 
-def repack_csv_file(fin, fout, index_fout, chunk_size, column=DEFAULT_CSV_COLUMN,
-                    delimiter=DEFAULT_CSV_DELIMITER):
+def repack_csv_file(
+    fin: IO[bytes],
+    fout: IO[bytes],
+    index_fout: IO[bytes],
+    chunk_size: int,
+    column: int = DEFAULT_CSV_COLUMN,
+    delimiter: str = DEFAULT_CSV_DELIMITER,
+    output_compression: str = Compression.GZIP.value,
+) -> None:
     """Repack a CSV file.
 
-    :param file fin: A gzip-compressed binary file stream to read from.  Must contain CSV.
-    :param file fout: A gzip-compressed binary file stream to write to.
-    :param file index_fout: A **text** file stream to write the index to.
-    :param int chunk_size: The number of lines to include in each chunk.
-    :param str column: The index of the column to use when creating the index.
-    :param str delimiter: The CSV column delimiter.
+    :param fin: A compressed binary file stream to read from.  Must contain CSV.
+    :param fout: A compressed binary file stream to write to.
+    :param index_fout: A **text** file stream to write the index to.
+    :param chunk_size: The number of lines to include in each chunk.
+    :param column: The index of the column to use when creating the index.
+    :param delimiter: The CSV column delimiter.
+    :param output_compression: The compression format of the output file. Supports gzip and zstd.
     """
     extractor = functools.partial(_extract_keys_from_csv, column=column, delimiter=delimiter)
-    return _repack(fin, fout, index_fout, chunk_size, extractor)
+    return _repack(fin, fout, index_fout, chunk_size, extractor, output_compression)
 
 
-def get_exe(*preference):
+def get_exe(*preference) -> Optional[str]:
     """Return the path to the full executable, given a list of candidates.
 
     The list should be in order of decreasing preference.
@@ -652,3 +832,4 @@ def get_exe(*preference):
         path = distutils.spawn.find_executable(exe)
         if path:
             return path
+    return None

@@ -3,3 +3,4 @@ pytest-runner
 flake8
 smart-open==1.8.4
 plumbum==1.6.7
+zstandard==0.15.1

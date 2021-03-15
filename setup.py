@@ -13,7 +13,7 @@ def read(fname):
 
 
 version = read('gzipi/VERSION').split('\n')[0]
-requirements = ['smart-open', 'plumbum']
+requirements = ['smart-open', 'plumbum', 'zstandard', ]
 setup_requirements = []
 test_requirements = ['pytest', 'flake8', ]
 
